@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Go build artifacts
+/bin/
+*.exe
+*.out
+*.test
+
+# Local log/data files produced at runtime
+*.log
+/data/
