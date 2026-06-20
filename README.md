@@ -1,115 +1,207 @@
-# Distributed-WAL-based-Event-Log-Engine
-A standalone Write-Ahead Log + Snapshot engine that applications can embed or run as a sidecar.
+# Distributed WAL-based Event Log Engine
 
+A small, append-only **event log** engine written in Go — the same core idea
+that powers Kafka. Producers **append** opaque byte events; consumers **read**
+them back **by offset**. Data is persisted to disk as a durable
+**Write-Ahead Log (WAL)** and survives restarts and crashes.
 
-SO it is like Kafka Where producers append consumers read
-We store them as log not in queue because queue is in-memory the data can be lost
-So we store them as log
-We need to maintain the offsets of consumers also (multiple or one)
-The way we append is also important as offsets are there
-Even with multiple producers we need to make only one write so use mutex lock
+> **Status: Phase 1 — embedded library.** Runs in-process, no network. The goal
+> of this phase is a correct, durable, single-file log with crash recovery and
+> consumer offset tracking. Networking, segmentation, retention and snapshots
+> come in later phases (see [Roadmap](#roadmap)).
 
------------------------------------------------
-#### Defer: consumer groups / partition assignment. That's advanced Kafka. Skeleton = "any consumer reads from any offset."
+---
 
-NOTE: Need to see this
------------------------------------------------
+## Mental model: a log, not a queue
 
+```
+            append ──►  ┌───┬───┬───┬───┬───┬───┐
+producers ───────────►  │ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ ◄── new events go on the end
+                        └───┴───┴───┴───┴───┴───┘
+                          ▲           ▲
+                          │           │
+                consumer B reads      consumer A reads
+                  (offset 1)            (offset 4)
+```
 
-##### Storage
-Now We want to see how we want to store the event in binary or bytes format but in file
+- It is an **append-only file on disk**, not an in-memory queue.
+- **Reading removes nothing.** Every consumer keeps its own offset and reads
+  independently — consumer A at offset 4 doesn't affect consumer B at offset 1.
+- An **offset** is just the sequence number of an event: 0, 1, 2, …
 
-## Simple:
-Fixed Length we will store so it will be easy not dynamic
-Question: how we will store now you have bytes we need header also right because many events can be stored in one file
+---
 
-Store based on date??
--- But what if today we got millions of events we cannot store them in one file right?
+## On-disk format
 
-Or create folder by date and store events in separate files??
+Events are stored back-to-back as length-prefixed records. There is **no header
+at the top of the file** — the file is pure appended records.
 
-### NOTE: Security We need to add the check also so data is not corrupted
+```
+ record 0            record 1            record 2
+┌────────┬─────────┬────────┬─────────┬────────┬─────────┐
+│ len=5  │ "hello" │ len=5  │ "world" │ len=3  │ "abc"   │
+│ 4 byte │ 5 bytes │ 4 byte │ 5 bytes │ 4 byte │ 3 bytes │
+└────────┴─────────┴────────┴─────────┴────────┴─────────┘
+ ▲                  ▲                  ▲
+ pos=0              pos=9              pos=18
+```
 
-For now we think we store in one file which if size exceeds 1GB we create a new file
+To read a record: read the 4-byte length `N`, then read the next `N` bytes.
+`len` is a big-endian `uint32`. The engine never looks inside the payload — it
+stores and returns **opaque bytes**.
 
+### The index lives in RAM, not on disk
 
-### OFFSET
-We create consumer owned for now whcih is simple for now
+The map of `offset → byte position` is kept **in memory** and **rebuilt by
+scanning the file once on startup**. We do *not* store positions in the file,
+because that would require seeking back to rewrite a header on every append —
+which would no longer be append-only.
 
+```
+in memory:   Index = [0, 9, 18]      // Index[offset] = byte position
+on startup:  scan file front-to-back, rebuild Index, drop any torn tail record
+```
 
-### Calling
-PHASE1: We can just create a _test file and call the functions and use logger to printthe results.
+---
 
+## Durability: the "write-ahead" promise
 
-A single append-only log of opaque byte records, persisted to one file.
-    Append(data []byte) -> offset        // many callers, serialized by a mutex
-    Read(offset int64)  -> data, next    // many readers, removes nothing
-  Consumers track their own offset.  No network yet — it's a Go package.
-  File format: repeated [uint32 length][payload].
+`file.Write()` only copies bytes into the OS page cache. If power is lost, those
+bytes are gone even though `Write` returned success. So before we acknowledge an
+append as successful, we call **`fsync` (`File.Sync()`)** to force the bytes onto
+physical disk.
 
- In Go, file.Write(bytes) does not put bytes on the physical disk — it hands them to the OS page cache. If the power dies one second later, those
-  bytes are gone, even though Write returned success. You'd tell a producer "saved!" and then lose it.
-The soul of a WAL is: fsync (Go: f.Sync()) BEFORE you acknowledge success. That's the actual durability promise — "when I say it's written, it
-  survived."
+```
+Append(data):
+   lock
+     write [len][payload] at end of file
+     fsync()                  ◄── only NOW is it durable
+     record position in Index
+     offset = len(Index)
+   unlock
+   return offset
+```
 
-  The tuning (fsync on every single append = safe but slow, vs. fsync every few ms in a batch = fast but you can lose the last few) is deferrable.
-  But the concept is the whole point of the name, so put a f.Sync() in from day one and optimize later.
+If a crash happens mid-write, recovery on the next startup detects the
+half-written tail record and **truncates** it, so the log only ever contains
+whole, durable records.
 
+---
 
-About opening file the permissions we give just a brief learning -->
+## Concurrency model
 
- Format: 0o644
+| Operation | Lock? | Why |
+|-----------|-------|-----|
+| `Append`  | **Yes**, one mutex | Appends must get unique, ordered offsets; only one write at a time. |
+| `Read`    | **No** I/O lock | Past records are immutable. Readers use `ReadAt(pos)` (positional, no shared cursor) so many readers run concurrently with the writer. |
 
-  - 0o = octal literal prefix in Go (same as 0644)
-  - Three digits = permissions for owner, group, others
+Many producers funnel through the single write lock; any number of consumers
+read in parallel without blocking the writer.
 
-  Each digit is a sum of:
-  - 4 = read (r)
-  - 2 = write (w)
-  - 1 = execute (x)
+---
 
-  So 0o644 means:
+## Architecture (Phase 1)
 
-  ┌────────┬───────┬────────────────────┐
-  │  Who   │ Digit │      Meaning       │
-  ├────────┼───────┼────────────────────┤
-  │ Owner  │ 6     │ read + write (4+2) │
-  ├────────┼───────┼────────────────────┤
-  │ Group  │ 4     │ read only          │
-  ├────────┼───────┼────────────────────┤
-  │ Others │ 4     │ read only          │
-  └────────┴───────┴────────────────────┘
+```
+                       ┌─────────────────────────────────────┐
+   producer ──Append──►│           appendeventlog            │
+                       │      (producer-facing wrapper)      │
+                       └───────────────┬─────────────────────┘
+                                       │
+                       ┌───────────────▼─────────────────────┐
+                       │                wal                  │
+                       │  WALWriter: file + mutex + Index    │   events.log
+                       │  WALReader: own RO handle, ReadAt   │◄──────────────►  (disk)
+                       └───────────────▲─────────────────────┘
+                                       │
+                       ┌───────────────┴─────────────────────┐
+   consumer ──Next───► │            readeventlog             │
+                       │      (consumer-facing wrapper)      │
+                       └─────────────────────────────────────┘
 
-  How to decide
+   consumer ──commit─► consumeroffset  ──►  consumer-A.offset  (disk)
+                       (8-byte uint64, written via tmp-file + atomic rename)
+```
 
-  Pick based on what the file is and who should touch it:
+### Packages
 
-  ┌─────────────────────────────────────────────────┬───────┬───────────────────────────────────────────────┐
-  │                    Use case                     │ Mode  │                      Why                      │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Regular data file (logs, WAL segments, configs) │ 0o644 │ Owner writes, everyone reads. Default choice. │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Sensitive file (secrets, keys, tokens)          │ 0o600 │ Only owner can read/write                     │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Shared writable file (rare)                     │ 0o664 │ Owner + group can write                       │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Executable script                               │ 0o755 │ Everyone can run, only owner writes           │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Private executable                              │ 0o700 │ Only owner can read/write/execute             │
-  ├─────────────────────────────────────────────────┼───────┼───────────────────────────────────────────────┤
-  │ Public-readable secret-ish                      │ 0o640 │ Owner read/write, group read, others nothing  │
-  └─────────────────────────────────────────────────┴───────┴───────────────────────────────────────────────┘
+| Package | Responsibility |
+|---------|----------------|
+| `internal/wal` | Core engine: durable append (`WALWriter`) and positional read (`WALReader`). |
+| `internal/appendeventlog` | Producer-facing API: `Append([]byte) -> offset`. |
+| `internal/readeventlog`   | Consumer-facing API: `Next() -> data, offset` / `ReadAt(offset)`. |
+| `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery. |
+| `cmd`                     | Phase-1 demo wiring it all together. |
 
+---
 
-w.File.Write(header[:])  // header is, say, 16 bytes
-  w.File.Write(data)       // data is, say, 50 bytes
+## Run the demo
 
-  After both calls, the file looks like:
+```bash
+go run ./cmd
+```
 
-  [ existing 100 bytes ][ 16 header bytes ][ 50 data bytes ]
-                        ^                   ^
-                        byte 100            byte 116
+It appends five events, reads two as a consumer, commits its offset, simulates a
+**crash**, then restarts and **resumes from the committed offset**:
 
-  File is now 166 bytes. Header and payload are contiguous — back-to-back, no separator.
+```
+  appended offset=0  event="user.signup"
+  ...
+-- consumer reads two events, commits, then crashes --
+  read offset=0  event="user.signup"
+  read offset=1  event="order.created"
+  committed next-offset=2, then CRASH
+-- consumer restarts, resumes from committed offset --
+  loaded committed offset=2
+  read offset=2  event="order.paid"
+  read offset=3  event="order.shipped"
+  read offset=4  event="user.deleted"
+  caught up — no more events
+```
 
+### Core API
 
+```go
+// Producer
+p, _ := eventlog.NewEventLogAppend("events.log")
+offset, _ := p.Append([]byte("hello"))      // -> 0
+
+// Consumer
+r, _ := readeventlog.NewReadEventLog("events.log", p.Writer())
+data, off, err := r.Next()                   // -> "hello", 0, nil
+//                                              io.EOF when caught up
+
+// Crash recovery
+ow := offset.NewOffsetWriter("consumer-A.offset")
+ow.Write(off + 1)                            // commit progress
+resume, _ := offset.NewOffsetReader("consumer-A.offset").Read()
+r.Seek(resume)                               // resume after restart
+```
+
+---
+
+## Roadmap
+
+| Phase | Adds | Key concepts learned |
+|-------|------|----------------------|
+| **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
+| 2 — Integrity | CRC checksum + timestamp per record | corruption detection |
+| 3 — Segments & retention | Roll to a new file every N MB; delete/compact old segments | log segmentation, retention |
+| 4 — Persisted index | Separate `.index` file to skip the startup scan | fast recovery (how Kafka does it) |
+| 5 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
+| 6 — Partitions & consumer groups | Multiple logs + offset coordination | horizontal scale, the rest of Kafka |
+
+---
+
+## Project layout
+
+```
+cmd/main.go                                  # Phase-1 demo
+internal/
+  wal/wal_writer.go                          # durable append + recovery
+  wal/wal_reader.go                          # positional reads by offset
+  appendeventlog/append_event_log.go         # producer API
+  readeventlog/read_event_log.go             # consumer API
+  consumeroffset/consumer_offset_writer.go   # commit offset (atomic)
+  consumeroffset/consumer_offset_reader.go   # load offset on restart
+```
