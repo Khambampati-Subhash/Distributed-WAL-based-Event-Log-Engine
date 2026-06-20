@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -25,10 +26,27 @@ type WALWriter struct {
 // NewWalWriter opens (or creates) the log file and rebuilds the in-memory
 // index from whatever is already on disk, so the log survives a restart.
 func NewWalWriter(filename string) (*WALWriter, error) {
+	// Did the file already exist? If we're about to create it, the new
+	// directory entry must itself be fsynced (see below) or a crash could
+	// lose the file's name even though its data was synced.
+	_, statErr := os.Stat(filename)
+	isNew := os.IsNotExist(statErr)
+
 	// O_APPEND => every Write lands at the end of the file.
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %q: %w", filename, err)
+	}
+
+	// fsync the parent directory so the newly-created log file's directory
+	// entry is durable. fsyncing the file persists its data + inode but NOT
+	// the directory that names it; without this a crash right after creation
+	// could leave the file nameless (effectively gone).
+	if isNew {
+		if err := fsyncDir(filepath.Dir(filename)); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("wal: fsync dir for %q: %w", filename, err)
+		}
 	}
 
 	w := &WALWriter{File: file}
@@ -37,6 +55,18 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 		return nil, err
 	}
 	return w, nil
+}
+
+// fsyncDir flushes a directory's own metadata to stable storage. This is what
+// makes a create/rename of a file *inside* that directory durable: fsyncing a
+// file does not persist the directory entry that names it.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir) // open the directory read-only
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync() // fsync the directory fd
 }
 
 // Write appends one opaque record and returns the offset it was stored at.

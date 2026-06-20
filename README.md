@@ -64,12 +64,34 @@ on startup:  scan file front-to-back, rebuild Index, drop any torn tail record
 
 ---
 
-## Durability: the "write-ahead" promise
+## Storage & Durability
 
-`file.Write()` only copies bytes into the OS page cache. If power is lost, those
-bytes are gone even though `Write` returned success. So before we acknowledge an
-append as successful, we call **`fsync` (`File.Sync()`)** to force the bytes onto
-physical disk.
+This engine persists two different things, in two different ways, for two
+different access patterns:
+
+| What | File | Access pattern | How it's written |
+|------|------|----------------|------------------|
+| **Events** (the log) | `events.log` | append-only, never modified | append record + `fsync` |
+| **Consumer offset** | `consumer-A.offset` | a single value, overwritten in place | tmp file + `fsync` + atomic rename + dir `fsync` |
+
+The reason they differ: events are *immutable and grow forever*, so appending is
+natural and safe. An offset is *one small value that changes*, so we can't
+append — we must replace it, and replacing a file safely is surprisingly subtle.
+
+### The core problem: `Write()` is not durable
+
+`file.Write()` only copies bytes into the **OS page cache** (RAM). The OS flushes
+them to physical disk later, on its own schedule. If power is lost in between,
+the bytes are gone — even though `Write` returned success. The fix is
+**`fsync` (`File.Sync()`)**, which forces the bytes onto stable storage and only
+returns once they're durable. The rule everywhere in this engine is:
+
+> **Write bytes → `fsync` → only then acknowledge success.**
+
+### 1. Storing events (the WAL)
+
+Each append writes a length-prefixed record at the end of the file, fsyncs, and
+only then returns the offset to the producer:
 
 ```
 Append(data):
@@ -84,7 +106,69 @@ Append(data):
 
 If a crash happens mid-write, recovery on the next startup detects the
 half-written tail record and **truncates** it, so the log only ever contains
-whole, durable records.
+whole, durable records. (Plus, when the file is first *created*, we fsync its
+parent directory — see [Atomicity ≠ durability](#atomicity--durability) below
+for why.)
+
+### 2. Storing the consumer offset (atomic replace)
+
+The offset is 8 bytes (`uint64`) that changes every commit. We **never overwrite
+it in place** — a crash mid-overwrite could leave a torn value (half old, half
+new = garbage). Instead we use the standard atomic-replace recipe:
+
+```
+Commit(offset):
+   write 8 bytes to consumer-A.offset.tmp
+   fsync(tmp)                       ◄── 1. data durable
+   close(tmp)
+   rename(tmp, consumer-A.offset)   ◄── 2. atomic swap (old OR new, never torn)
+   fsync(parent directory)          ◄── 3. the rename itself durable
+```
+
+This is the same pattern databases use to update config/manifest/checkpoint
+files (and how tools safely update `/etc/passwd`). On recovery, `OffsetReader`
+reads it back; a brand-new consumer that never committed reads "no file" as
+offset `0` (start from the beginning).
+
+### Atomicity ≠ durability
+
+This is the subtle part, and it's why step 3 above exists.
+
+- **`rename()` gives atomicity:** at any instant a reader sees either the old
+  file or the new file, never a half-written mix. That's about *visibility*.
+- **It says nothing about durability.** A rename works by modifying the **parent
+  directory's** contents — the entry mapping the name `consumer-A.offset` to an
+  inode. That change is *directory metadata*, and like everything else it lands
+  in the page cache first.
+
+Critically, **fsyncing a file does NOT fsync the directory that names it** —
+they're separate inodes with separate dirty pages. So after `fsync(tmp)` +
+`rename`, a crash can still leave the directory entry pointing at the *old*
+inode. To make the rename (and, for `events.log`, the initial create) durable we
+must also **`fsync` the parent directory**:
+
+```go
+func fsyncDir(dir string) error {
+    d, err := os.Open(dir)   // open the directory read-only
+    if err != nil { return err }
+    defer d.Close()
+    return d.Sync()          // fsync the directory fd
+}
+```
+
+> **macOS note:** plain `fsync()` on darwin only flushes to the *drive's* cache,
+> not the platters; full durability needs `fcntl(F_FULLFSYNC)`. Go's
+> `File.Sync()` already issues `F_FULLFSYNC` on darwin, so the engine is durable
+> on this machine — but that's about file data; the directory `fsync` above is
+> still required to persist the *name*.
+
+### Durability summary
+
+| Failure | Events (`events.log`) | Offset (`consumer-A.offset`) |
+|---------|----------------------|------------------------------|
+| Process exits cleanly | safe (page cache survives the process) | safe |
+| OS crash / power loss after ack | safe (fsynced data + fsynced dir on create) | safe (fsynced tmp + fsynced dir on rename) |
+| Crash *mid-write* | torn tail record truncated on recovery | impossible — old file stays intact until atomic rename |
 
 ---
 
@@ -120,7 +204,7 @@ read in parallel without blocking the writer.
                        └─────────────────────────────────────┘
 
    consumer ──commit─► consumeroffset  ──►  consumer-A.offset  (disk)
-                       (8-byte uint64, written via tmp-file + atomic rename)
+                       (8-byte uint64: tmp + fsync + atomic rename + dir fsync)
 ```
 
 ### Packages

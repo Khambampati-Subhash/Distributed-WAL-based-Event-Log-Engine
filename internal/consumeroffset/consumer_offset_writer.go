@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -54,5 +55,17 @@ func (w *OffsetWriter) Write(offset uint64) error {
 	if err := os.Rename(tmp, w.path); err != nil {
 		return fmt.Errorf("offset: rename %q -> %q: %w", tmp, w.path, err)
 	}
+	if err := fsyncDir(filepath.Dir(w.path)); err != nil {
+		return fmt.Errorf("error while fsync the dir: %s", err)
+	}
 	return nil
+}
+
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir) // open the directory read-only
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync() // fsync the directory fd
 }
