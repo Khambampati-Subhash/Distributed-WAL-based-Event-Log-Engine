@@ -113,6 +113,15 @@ func (w *WALWriter) PositionOf(offset uint64) (int64, bool) {
 	return w.Index[offset], true
 }
 
+// NextOffset returns the offset the next Write will be assigned, i.e. the
+// number of records currently in the log. Used to compute consumer lag
+// (lag = NextOffset - consumer's current offset).
+func (w *WALWriter) NextOffset() uint64 {
+	w.Mu.Lock()
+	defer w.Mu.Unlock()
+	return uint64(len(w.Index))
+}
+
 // Close closes the underlying file.
 func (w *WALWriter) Close() error {
 	w.Mu.Lock()

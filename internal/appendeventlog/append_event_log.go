@@ -31,6 +31,12 @@ func (el *AppendEventlog) Writer() *wal.WALWriter {
 	return el.walWriter
 }
 
+// NextOffset returns the offset the next Append will assign (i.e. how many
+// events the log currently holds). Used to compute consumer lag.
+func (el *AppendEventlog) NextOffset() uint64 {
+	return el.walWriter.NextOffset()
+}
+
 // Close flushes and closes the log file.
 func (el *AppendEventlog) Close() error {
 	return el.walWriter.Close()
