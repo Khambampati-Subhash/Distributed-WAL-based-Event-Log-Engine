@@ -33,22 +33,25 @@ producers ───────────►  │ 0 │ 1 │ 2 │ 3 │ 4 �
 
 ## On-disk format
 
-Events are stored back-to-back as length-prefixed records. There is **no header
-at the top of the file** — the file is pure appended records.
+Events are stored back-to-back as length-prefixed records, each carrying a
+CRC32C checksum for integrity (Phase 2). There is **no header at the top of the
+file** — the file is pure appended records.
 
 ```
- record 0            record 1            record 2
-┌────────┬─────────┬────────┬─────────┬────────┬─────────┐
-│ len=5  │ "hello" │ len=5  │ "world" │ len=3  │ "abc"   │
-│ 4 byte │ 5 bytes │ 4 byte │ 5 bytes │ 4 byte │ 3 bytes │
-└────────┴─────────┴────────┴─────────┴────────┴─────────┘
- ▲                  ▲                  ▲
- pos=0              pos=9              pos=18
+ record 0                       record 1
+┌────────┬────────┬─────────┬────────┬────────┬─────────┐
+│ len=5  │ crc    │ "hello" │ len=5  │ crc    │ "world" │
+│ 4 byte │ 4 byte │ 5 bytes │ 4 byte │ 4 byte │ 5 bytes │
+└────────┴────────┴─────────┴────────┴────────┴─────────┘
+ ▲                           ▲
+ pos=0                       pos=13
+ └──── CRC covers (len ‖ payload) ────┘
 ```
 
-To read a record: read the 4-byte length `N`, then read the next `N` bytes.
-`len` is a big-endian `uint32`. The engine never looks inside the payload — it
-stores and returns **opaque bytes**.
+To read a record: read the 4-byte length `N`, read the 4-byte CRC, then read the
+next `N` payload bytes and verify the CRC. `len` and `crc` are big-endian
+`uint32`. The engine never looks inside the payload — it stores and returns
+**opaque bytes**. See [Integrity (CRC32C)](#integrity-crc32c) for why and how.
 
 ### The index lives in RAM, not on disk
 
@@ -172,6 +175,98 @@ func fsyncDir(dir string) error {
 
 ---
 
+## Integrity (CRC32C)
+
+Durability (above) guarantees that bytes we acknowledged *reach the disk*. But
+disks lie: a bit can silently flip months later (**bit-rot**), a controller can
+misdirect a write, a cosmic ray can corrupt a sector. The bytes are *there*, but
+*wrong* — and nothing complains. This is the nastiest class of storage bug,
+because you get wrong answers with no error. **Phase 2 adds a CRC32C checksum per
+record so corruption is always detected, never silently served.**
+
+### Detection ≠ correction
+
+A checksum tells you **"these bytes are wrong."** It cannot tell you **"here are
+the right bytes."** Repairing data needs redundancy we don't have on a single
+node — another replica, or parity/erasure coding (future phases). So Phase 2's
+guarantee is precise:
+
+> We will never silently hand a consumer corrupted bytes as if they were valid.
+> We detect it and surface a `CorruptionError`.
+
+### Why CRC32C specifically?
+
+| Option | Verdict | Why |
+|--------|---------|-----|
+| **CRC32C (Castagnoli)** ✅ | **chosen** | Hardware-accelerated (one CPU instruction on modern x86/ARM → ~free); superior burst-error detection; **this is what Kafka, ext4, and iSCSI use.** |
+| CRC32 (IEEE / zlib) | rejected | Equally simple but no guaranteed HW acceleration and weaker error properties than Castagnoli. Only "more familiar." |
+| MD5 / SHA-256 | rejected | These are *cryptographic* hashes — built to resist a malicious forger, at 10–50× the CPU cost. We're defending against **random disk faults, not attackers.** At ~694 events/sec (the real target workload) a crypto hash per record adds needless latency. |
+| No checksum (Phase 1) | rejected | Can only catch a *torn tail* at EOF. A flipped bit in the *middle* of a complete record goes completely undetected. |
+
+The mental model: **CRC is a smoke detector, not a safe.** It's cheap, fast, and
+catches accidents. It is *not* trying to stop a determined attacker — that's a
+different problem (signatures/MACs) we don't have here.
+
+### What the CRC covers, and why
+
+The CRC is computed over **`length ‖ payload`**, not the payload alone:
+
+```
+crc = CRC32C( [4-byte length] + [payload bytes] )
+```
+
+A bit-flip in the **length field** is the most dangerous corruption: it
+mis-frames the record (the reader reads the wrong number of bytes and everything
+after it shifts). Covering the length means that case is caught too. The CRC
+field itself is *not* covered — a checksum cannot checksum itself.
+
+### The 3-way recovery decision tree
+
+On startup the engine scans the file; each record falls into exactly one bucket,
+and each gets a **different** response:
+
+```
+read [len][crc][payload] at current position
+│
+├─ EOF partway through a record  ─────────► TORN TAIL (crash mid-write)
+│                                            → truncate here, keep prior records
+│                                              (this is expected & safe)
+│
+├─ len < 0 or len > 64 MB (sanity cap)  ──► CORRUPT LENGTH field
+│                                            → return CorruptionError, STOP
+│
+└─ full record read, CRC ≠ stored  ───────► BIT-ROT in a complete record
+                                             → return CorruptionError, STOP
+```
+
+Two design choices worth calling out:
+
+1. **The 64 MB `maxRecordSize` cap is load-bearing, not cosmetic.** Without it, a
+   corrupted length claiming "5 GB" would either OOM the reader, or — if it
+   points just past EOF — be *misread as a torn tail and silently truncated*,
+   turning corruption into data loss. The cap is what lets us tell an honest
+   torn tail apart from a corrupt length.
+
+2. **On real corruption we STOP, we don't skip or truncate.** Skipping a bad
+   record leaves a silent hole in the offset sequence; truncating throws away
+   every (possibly good) record *after* the corruption. Stopping and surfacing
+   the error lets an operator investigate (is the disk failing? are other files
+   affected?) and decide. Never silently paper over corruption.
+
+### CRC is verified on *every read*, not just at startup
+
+Bit-rot can strike a record *after* the engine has booted and indexed it. So the
+CRC is recomputed and checked inside `ReadAt` on **every** read, not only during
+the startup scan — otherwise we could serve corruption that appeared at runtime.
+Because CRC32C is hardware-accelerated, this per-read cost is negligible. (This
+is exactly what Kafka does.)
+
+> **Format compatibility:** Phase-2 records carry 4 extra bytes (the CRC), so a
+> Phase-1 log file cannot be read by Phase-2 and vice versa. For this tagged
+> learning project that's intentional — start each phase with a fresh log.
+
+---
+
 ## Concurrency model
 
 | Operation | Lock? | Why |
@@ -269,7 +364,7 @@ r.Seek(resume)                               // resume after restart
 | Phase | Adds | Key concepts learned |
 |-------|------|----------------------|
 | **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
-| 2 — Integrity | CRC checksum + timestamp per record | corruption detection |
+| **2 — Integrity** ✅ | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
 | 3 — Segments & retention | Roll to a new file every N MB; delete/compact old segments | log segmentation, retention |
 | 4 — Persisted index | Separate `.index` file to skip the startup scan | fast recovery (how Kafka does it) |
 | 5 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
