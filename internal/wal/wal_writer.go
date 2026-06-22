@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,16 +12,51 @@ import (
 
 // On-disk record format (repeated, append-only):
 //
-//	[ length : 4-byte big-endian uint32 ][ payload : <length> bytes ]
+//	[ length : 4-byte big-endian uint32 ]
+//	[ crc    : 4-byte big-endian CRC32C of (length || payload) ]
+//	[ payload : <length> bytes ]
 //
-// There is NO position written into the file. The offset->position index
-// lives in memory (Index) and is rebuilt by scanning the file once on startup.
-const headerSize = 4
+// Phase 2 adds CRC32C (Castagnoli) for integrity detection. The CRC is computed
+// over the length field AND the payload (not just the payload), so a bit-flip in
+// the length itself — which would cause mis-framing — is also caught.
+//
+// CRC32C (not IEEE/standard CRC32) is chosen because:
+//  1. Kafka uses it (mirrors the real thing)
+//  2. Hardware-accelerated on modern x86/ARM (single CPU instruction), so zero cost
+//  3. Better error detection properties for storage (detects more burst errors)
+//  4. Go: hash/crc32.MakeTable(crc32.Castagnoli) provides the polynomial
+//
+// Why CRC, not SHA256 or MD5?
+//   - SHA/MD5 are cryptographic hashes (hard to forge), but FAR more expensive
+//   - CRC is non-cryptographic but designed for bit-flip detection (fast, sufficient)
+//   - Per-record CRC is about "did my disk corrupt this", not "did an attacker forge it"
+//   - At 694 events/sec (your real workload), SHA per-record adds unacceptable latency
+//
+// The CRC field itself is NOT checksummed (a checksum can't checksum itself).
+const (
+	lengthSize       = 4
+	crcSize          = 4
+	recordHeaderSize = lengthSize + crcSize
+	maxRecordSize    = 64 * 1024 * 1024 // 64MB sanity cap
+)
+
+// CorruptionError indicates detected bit-rot or corruption in the log.
+type CorruptionError struct {
+	Offset   int64  // byte position in file
+	Expected uint32 // expected CRC
+	Got      uint32 // actual CRC computed from bytes
+	Reason   string // "length out of bounds", "crc mismatch", etc.
+}
+
+func (e *CorruptionError) Error() string {
+	return fmt.Sprintf("wal: corruption at byte %d: %s (crc: expected %08x, got %08x)", e.Offset, e.Reason, e.Expected, e.Got)
+}
 
 type WALWriter struct {
-	Mu    sync.Mutex // serializes producers: one append at a time
-	File  *os.File   // the open append-only file (opened once, held here)
-	Index []int64    // Index[offset] = byte position where that record starts
+	Mu    sync.Mutex   // serializes producers: one append at a time
+	File  *os.File     // the open append-only file (opened once, held here)
+	Index []int64      // Index[offset] = byte position where that record starts
+	table *crc32.Table // CRC32C (Castagnoli) polynomial, reused for all computations
 }
 
 // NewWalWriter opens (or creates) the log file and rebuilds the in-memory
@@ -49,7 +85,10 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 		}
 	}
 
-	w := &WALWriter{File: file}
+	w := &WALWriter{
+		File:  file,
+		table: crc32.MakeTable(crc32.Castagnoli),
+	}
 	if err := w.rebuildIndex(); err != nil {
 		file.Close()
 		return nil, err
@@ -74,30 +113,47 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 	w.Mu.Lock()
 	defer w.Mu.Unlock()
 
-	// Where this record will start = current end of file.
+	// Sanity check: refuse to store records that are unreasonably large.
+	// This cap distinguishes "honest corruption in length field" from "torn tail".
+	if len(data) > maxRecordSize {
+		return 0, fmt.Errorf("wal: payload too large (%d > %d)", len(data), maxRecordSize)
+	}
+
+	// Current end of file = the byte position where this record will start.
 	pos, err := w.File.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, fmt.Errorf("wal: seek end: %w", err)
 	}
 
-	var header [headerSize]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
+	// Build the length header (4 bytes, big-endian).
+	var lenBuf [lengthSize]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 
-	if _, err := w.File.Write(header[:]); err != nil {
-		return 0, fmt.Errorf("wal: write header: %w", err)
+	// Compute CRC32C over (length || payload). The CRC itself is NOT included.
+	crcChecksum := crc32.Checksum(lenBuf[:], w.table)
+	crcChecksum = crc32.Update(crcChecksum, w.table, data)
+
+	// Build the CRC header (4 bytes, big-endian).
+	var crcBuf [crcSize]byte
+	binary.BigEndian.PutUint32(crcBuf[:], crcChecksum)
+
+	// Write: [ len:4 ][ crc:4 ][ payload:N ]
+	if _, err := w.File.Write(lenBuf[:]); err != nil {
+		return 0, fmt.Errorf("wal: write length: %w", err)
+	}
+	if _, err := w.File.Write(crcBuf[:]); err != nil {
+		return 0, fmt.Errorf("wal: write crc: %w", err)
 	}
 	if _, err := w.File.Write(data); err != nil {
 		return 0, fmt.Errorf("wal: write payload: %w", err)
 	}
 
-	// fsync — the "ahead" in write-ahead log. Until this returns the bytes
-	// only live in the OS page cache; a power loss would lose them. We
-	// acknowledge success ONLY after the data is durable on disk.
+	// fsync — data is only durable after this returns.
 	if err := w.File.Sync(); err != nil {
 		return 0, fmt.Errorf("wal: fsync: %w", err)
 	}
 
-	offset := uint64(len(w.Index)) // offset is just "which record # is this"
+	offset := uint64(len(w.Index))
 	w.Index = append(w.Index, pos)
 	return offset, nil
 }
@@ -130,36 +186,83 @@ func (w *WALWriter) Close() error {
 }
 
 // rebuildIndex scans the file once on startup and reconstructs Index.
-// The file is the source of truth; the index is a derived lookup table.
+// Phase 2: also verifies CRC32C for every record and applies a 3-way decision tree:
+//
+//  1. Torn tail (partial record at EOF) → truncate, keep valid records
+//  2. Corrupt length (out of bounds)   → return CorruptionError, stop
+//  3. CRC mismatch (bit-rot in complete record) → return CorruptionError, stop
+//
+// The rationale: torn tails are expected after crashes and safe to truncate.
+// Bit-rot is unexpected and requires operator intervention (investigate disk,
+// consider if more files are corrupt, etc). Never silently skip corrupt records.
 func (w *WALWriter) rebuildIndex() error {
 	if _, err := w.File.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek start: %w", err)
 	}
 
-	header := make([]byte, headerSize)
+	lenBuf := make([]byte, lengthSize)
+	crcBuf := make([]byte, crcSize)
 	var pos int64
+
 	for {
-		_, err := io.ReadFull(w.File, header)
+		// Read the length field (4 bytes).
+		_, err := io.ReadFull(w.File, lenBuf)
 		if err == io.EOF {
-			break // clean end: every whole record was read
+			break // clean end
 		}
 		if err == io.ErrUnexpectedEOF {
-			return w.truncateTorn(pos) // crash left a partial header
+			return w.truncateTorn(pos) // partial header — torn tail
 		}
 		if err != nil {
-			return fmt.Errorf("wal: read header at %d: %w", pos, err)
+			return fmt.Errorf("wal: read length at %d: %w", pos, err)
 		}
 
-		length := int64(binary.BigEndian.Uint32(header))
-		if _, err := io.CopyN(io.Discard, w.File, length); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return w.truncateTorn(pos) // crash left a partial payload
+		length := int64(binary.BigEndian.Uint32(lenBuf))
+
+		// Sanity check: a corrupted length field might claim an impossible size.
+		// If so, this is NOT a torn tail (we read the full 4 bytes); it's corruption.
+		if length < 0 || length > int64(maxRecordSize) {
+			return &CorruptionError{
+				Offset: pos,
+				Reason: fmt.Sprintf("length out of bounds: %d", length),
 			}
+		}
+
+		// Read the CRC field (4 bytes).
+		_, err = io.ReadFull(w.File, crcBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return w.truncateTorn(pos) // partial record — torn tail
+		}
+		if err != nil {
+			return fmt.Errorf("wal: read crc at %d: %w", pos, err)
+		}
+		storedCRC := binary.BigEndian.Uint32(crcBuf)
+
+		// Read the payload.
+		payload := make([]byte, length)
+		_, err = io.ReadFull(w.File, payload)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return w.truncateTorn(pos) // partial payload — torn tail
+		}
+		if err != nil {
 			return fmt.Errorf("wal: read payload at %d: %w", pos, err)
 		}
 
+		// Verify CRC32C over (length || payload).
+		computedCRC := crc32.Checksum(lenBuf, w.table)
+		computedCRC = crc32.Update(computedCRC, w.table, payload)
+
+		if computedCRC != storedCRC {
+			return &CorruptionError{
+				Offset:   pos,
+				Expected: storedCRC,
+				Got:      computedCRC,
+				Reason:   "crc mismatch (bit-rot or disk corruption)",
+			}
+		}
+
 		w.Index = append(w.Index, pos)
-		pos += headerSize + length
+		pos += recordHeaderSize + length
 	}
 
 	_, err := w.File.Seek(0, io.SeekEnd)
