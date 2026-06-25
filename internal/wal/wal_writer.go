@@ -57,6 +57,7 @@ type WALWriter struct {
 	File  *os.File     // the open append-only file (opened once, held here)
 	Index []int64      // Index[offset] = byte position where that record starts
 	table *crc32.Table // CRC32C (Castagnoli) polynomial, reused for all computations
+	size  int64        // current file size in bytes (tracked in-memory, no stat per write)
 }
 
 // NewWalWriter opens (or creates) the log file and rebuilds the in-memory
@@ -93,6 +94,15 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 		file.Close()
 		return nil, err
 	}
+
+	// Record the current file size (end position after recovery) so the
+	// segment manager can decide when to roll without stat-ing every write.
+	size, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("wal: size after recovery: %w", err)
+	}
+	w.size = size
 	return w, nil
 }
 
@@ -155,7 +165,16 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 
 	offset := uint64(len(w.Index))
 	w.Index = append(w.Index, pos)
+	w.size += recordHeaderSize + int64(len(data)) // track bytes written
 	return offset, nil
+}
+
+// Size returns the current size of the segment file in bytes. The segment
+// manager uses this to decide when to roll to a new segment.
+func (w *WALWriter) Size() int64 {
+	w.Mu.Lock()
+	defer w.Mu.Unlock()
+	return w.size
 }
 
 // PositionOf returns the byte position where the record at offset begins,
