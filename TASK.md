@@ -1,108 +1,77 @@
-# TASK.md — Problems to solve in Phase 3 (priority order)
+# TASK.md — Phase 3: Segments only
 
-Current state: a single-file, append-only WAL with CRC32C integrity
-(`v2-checksums`). Phase 3 adds **segments + retention**. Below are the problems
-in the current code, ordered by priority, with the fix each one needs.
+Phase 3 does **one thing**: split the single append-only file into multiple
+**segment files** in one directory. Retention, optimizations, and partitioning
+are explicitly deferred (see bottom) so this phase stays shippable.
 
----
-
-## P0 — Blockers (Phase 3 cannot work without these)
-
-### 1. Single file grows forever — no way to delete old data
-- **Problem:** All events live in one `events.log`. The only way to free space
-  is to delete the entire log. At ~3 GB/day (60M events × ~50 B) the disk fills.
-- **Fix:** Split the log into **segment files**, rolled by size
-  (`maxSegmentBytes`). Retention deletes whole aged-out segments.
-
-### 2. `Index []int64` assumes dense offsets from 0 — breaks on retention
-- **Problem:** `Index[offset] = bytePos` hard-assumes offset 0 always exists and
-  offsets are contiguous. The moment retention deletes the oldest data, offset 0
-  disappears and this model is wrong.
-- **Fix:** Per-segment index. Each segment owns
-  `{baseOffset, file, []int64 positions}`. Global lookup =
-  find segment by base offset → local position within it. (Kafka's model; this
-  is why segment files are named by base offset.)
-
-### 3. No time source for retention
-- **Problem:** Records have no timestamp, so the engine can't tell how old data
-  is → can't implement a 7-day policy.
-- **Fix (decided):** Track **per-segment last-append time** in engine-owned
-  metadata; fall back to file mtime only on cold start. (No per-record
-  timestamp → no seek-by-time later; accepted trade-off.)
+Record format is **unchanged** from Phase 2: `[len:4][crc:4][payload:N]`.
+A segment is just a *slice of the same log*, not a new format.
 
 ---
 
-## P1 — Must handle in Phase 3 (new behaviors retention introduces)
+## Layout
 
-### 4. Stale consumer offset (offset in a deleted segment)
-- **Problem:** A slow consumer's committed offset may point into a segment that
-  retention already deleted. Today `Read` would just fail confusingly.
-- **Fix (decided):** Reset to the **earliest surviving offset** and continue —
-  but **loudly**: surface a typed signal (e.g. `ErrOffsetResetToEarliest{
-  requested, resetTo, skipped }`) so the consumer knows it skipped data.
-
-### 5. Never delete the active segment
-- **Problem:** Retention must not delete the segment currently being written.
-- **Fix:** Retention check always skips the active segment.
-
-### 6. Startup must discover existing segments
-- **Problem:** Recovery currently scans one file. With many segment files it must
-  list the directory, sort by base offset, and rebuild a per-segment index.
-- **Fix:** On open, enumerate `*.log`, parse base offsets, rebuild each segment's
-  index (CRC-verified, as today), identify the active (highest base) segment.
-
----
-
-## P2 — Should fix (correctness/perf smells, not strictly blocking)
-
-### 7. `PositionOf` takes the write mutex — contradicts "reads are lock-free"
-- **Problem:** Disk reads don't take the lock, but the offset→position lookup
-  does, so readers contend with the writer.
-- **Fix:** `sync.RWMutex`, or an atomic snapshot of the segment index for readers.
-
-### 8. Consumer commits offset on every event — too much I/O
-- **Problem:** Per-event commit = ~4 syscalls (tmp + fsync + rename + dir fsync)
-  per processed event. Melts the disk at scale.
-- **Fix:** Commit periodically (every N events or T seconds). Trades a little
-  replay-on-crash for far less I/O. (Consumer-side; may land here or Phase 4.)
-
-### 9. Recovery cost grows unbounded (made worse by Phase 2)
-- **Problem:** Startup rescans + re-CRCs the entire log. Phase 2 added reading
-  every payload, so a large log = minutes of startup, growing forever.
-- **Note:** Partially mitigated by segments (only need to fully scan the active
-  segment if older segments' indexes are persisted) — but the real fix is a
-  **persisted index / checkpoint** in **Phase 4**. Tracked here, solved later.
-
----
-
-## P3 — Nice to have (defer unless trivial)
-
-- **10.** Three `Write` syscalls per record (len, crc, payload) → could be one
-  buffered write.
-- **11.** Recovery allocates a fresh `[]byte` per record to CRC then discards it
-  → GC churn; could stream through a reused buffer.
-- **12.** Reader holds a concrete `*WALWriter` (tight coupling) → an `Index`
-  interface would decouple reader from writer.
-
----
-
-## Configuration (decided)
-
-User-configurable **at startup only**, via a `Config` struct passed to the
-constructor:
-
-```go
-type Config struct {
-    Dir             string        // directory holding segment files
-    MaxSegmentBytes int64         // roll to a new segment past this size
-    Retention       time.Duration // delete segments whose last-append > this ago (default 7d)
-}
 ```
+<Config.Dir>/                          # the log directory
+  00000000000000000000.log             # segment: offsets 0…(base+N-1)
+  00000000000000001000.log             # next segment
+  00000000000000002000.log             # active segment (being appended)
+```
+
+- Filename = 20-digit zero-padded **base offset** (first offset in the segment).
+- Lookup: to find offset X, pick the segment with the largest base ≤ X.
+
+---
+
+## Phase 3 scope (DO NOW)
+
+### 1. `Segment` type
+One segment = one file + base offset + its own CRC-verified index + append/read.
+Essentially today's `WALWriter`, scoped to a single segment. Folds in the
+reader/writer decoupling and (optionally) the single-write naturally.
+
+### 2. Base-offset filenames
+20-digit zero-padded. Parse base offset from filename on startup.
+
+### 3. Roll by size
+When the active segment reaches `MaxSegmentBytes`, seal it and open a new
+segment whose base offset = next offset.
+
+### 4. Per-segment in-memory index
+Replace the single dense `Index []int64` with per-segment indexes:
+`{baseOffset, file, positions []int64}`. Route `Append` → active segment,
+`Read(offset)` → the segment owning that offset.
+
+### 5. Startup discovery
+On open: list `*.log`, parse + sort base offsets, rebuild each segment's index
+(CRC-verified, as Phase 2), mark the highest-base segment active.
+
+### 6. Cross-segment sequential reads
+A consumer's `Next()` walking offset 999 → 1000 must roll into the next segment
+file transparently.
+
+---
 
 ## Build order (each step compiles + tests green before the next)
 
-1. `Segment` type (one file + base offset + local CRC-verified index)
-2. `SegmentManager` (ordered segments, active segment, route Append/Read)
-3. Rolling (close active past `MaxSegmentBytes`, open next at new base offset)
-4. Retention (background delete of aged-out segments; loud stale-offset reset)
-5. `Config` + wire-up + tests (multi-segment, roll, retention delete, stale offset)
+1. `Segment` type (file + baseOffset + index + append/read)
+2. `SegmentManager` (ordered segments, active segment, route Append/Read, cross-segment reads)
+3. Rolling (seal active past `MaxSegmentBytes`, open next at new base offset)
+4. Startup discovery (enumerate + rebuild indexes + pick active)
+5. `Config{Dir, MaxSegmentBytes}` + wire-up + tests (multi-segment, roll, recover-many-segments, cross-boundary read)
+
+---
+
+## DEFERRED (with the phase that will do it)
+
+| Item | Why deferred | Phase |
+|------|--------------|-------|
+| **Retention** (delete aged segments, never the active one) | Its own concern; Phase 3 only *creates* segments | 4 |
+| **Stale-offset reset** (offset in a deleted segment → reset to earliest, *loudly* with a typed signal) | Only meaningful once retention can delete | 4 |
+| **Per-segment last-append time** (engine-tracked; mtime as cold-start fallback) | Only needed by retention | 4 |
+| **Single-write** per record (len+crc+payload in one syscall) | Carries forward cleanly; do with the perf patch | 5 |
+| **Atomic / RWMutex index lookup** (replace `PositionOf` write-lock) | Segments **replace** the index code this targets — optimizing first = polishing code we're about to delete | 5 |
+| **Single-read** (one syscall per record) | Reads ≠ writes: after first ReadAt the page is cached, so 2nd/3rd reads hit RAM not disk. Small win, and combining needs length-in-index (more memory). **Measure first.** | 5 |
+| **Sparse index** (every Nth offset, not every one) | Only makes sense per-segment, so needs segments first | 6 |
+| **Per-account / per-key folders** = **partitioning** (many independent logs) | NOT segmenting; engine has no "account" concept yet | 8 |
+| **Lazy fd open** (don't keep every segment open → OS fd limit) | Tutorial scale fine keeping open; conscious deferral | 5/6 |

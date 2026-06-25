@@ -361,14 +361,26 @@ r.Seek(resume)                               // resume after restart
 
 ## Roadmap
 
+Each phase is intentionally scoped to **one** idea so it ships. Bigger ideas
+that get conflated with the current phase (retention, partitioning, perf) are
+deliberately pushed to their own phase.
+
 | Phase | Adds | Key concepts learned |
 |-------|------|----------------------|
 | **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
 | **2 — Integrity** ✅ | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
-| 3 — Segments & retention | Roll to a new file every N MB; delete/compact old segments | log segmentation, retention |
-| 4 — Persisted index | Separate `.index` file to skip the startup scan | fast recovery (how Kafka does it) |
-| 5 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
-| 6 — Partitions & consumer groups | Multiple logs + offset coordination | horizontal scale, the rest of Kafka |
+| **3 — Segments** ⏳ | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads. **Format unchanged.** | log segmentation, base offsets |
+| 4 — Retention | Delete segments whose last-append > configured age; never delete the active segment; loud stale-offset reset; per-segment last-append time (mtime fallback) | retention, time-based cleanup |
+| 5 — Optimizations | Single-write per record (len+crc+payload); reader/index decoupled; atomic/`RWMutex` index lookup; (measure single-read) | I/O batching, lock-free reads |
+| 6 — Sparse index | Store every Nth offset → position (not every one); seek + scan-forward | bounded index memory (Kafka-style) |
+| 7 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
+| 8 — Partitions & consumer groups | Many independent logs (e.g. per key/"account"), per-partition offsets, group coordination | horizontal scale, the rest of Kafka |
+
+> **Scope notes (things explicitly deferred so Phase 3 stays small):**
+> - **Retention → Phase 4.** Phase 3 only *creates* segments; deleting them is its own phase.
+> - **"Per-account folder" → Phase 8 (partitioning), NOT segmenting.** Segmenting = one log split into files. Partitioning = many independent logs keyed by something. The engine has no notion of an "account" yet.
+> - **Date-wise filenames → rejected.** We name segments by *base offset* (needed for offset lookup) and roll by *size*; date names conflict with both.
+> - **Single-read / atomic index → Phase 5.** Deferred because segments rewrite the very index code those optimizations target — optimizing it first would be polishing code we're about to replace.
 
 ---
 
