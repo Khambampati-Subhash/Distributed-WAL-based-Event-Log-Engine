@@ -61,9 +61,49 @@ because that would require seeking back to rewrite a header on every append —
 which would no longer be append-only.
 
 ```
-in memory:   Index = [0, 9, 18]      // Index[offset] = byte position
+in memory:   Index = [0, 13, 26]     // Index[offset] = byte position
 on startup:  scan file front-to-back, rebuild Index, drop any torn tail record
 ```
+
+---
+
+## Segments (Phase 3)
+
+A single file can't grow forever and gives no way to delete old data. So the log
+is a **directory of segment files**, each holding a contiguous range of offsets.
+A segment is *not* a new format — it's just a slice of the same record stream.
+
+```
+<dir>/
+  00000000000000000000.log   offsets 0 .. 999      (sealed)
+  00000000000000001000.log   offsets 1000 .. 1999  (sealed)
+  00000000000000002000.log   offsets 2000 ..       (ACTIVE — appends land here)
+```
+
+- **Filename = base offset** (the first offset in the file), zero-padded to 20
+  digits so filenames sort in offset order. This is how Kafka names segments.
+- **Rolling:** when the active segment reaches `MaxSegmentBytes`, it is sealed
+  and a new active segment opens at the next offset.
+- **Lookup:** to read global offset `X`, binary-search the segments for the last
+  one whose base ≤ `X`, then read locally as `X − baseOffset`.
+- **Startup:** list `*.log`, parse + sort base offsets, rebuild each segment's
+  index (CRC-verified), mark the highest-base segment active.
+
+### Global vs local offsets
+
+Callers always use **global** offsets (0, 1, 2, … across the whole log). Inside
+a segment, a record's position is **local** (its slot within that one file):
+
+```
+global offset  ──(find owning segment)──►  local slot = global − baseOffset
+```
+
+This indirection is what makes deleting old segments safe later (Phase 4
+retention): offsets are no longer a single dense array from 0, they're keyed by
+each segment's base offset. The `SegmentManager` owns the ordered segments,
+routes `Append` to the active one, and routes each read to the segment that owns
+that offset. A consumer `Reader` walks the whole log with `Next()`, crossing
+segment boundaries transparently.
 
 ---
 
@@ -279,38 +319,46 @@ read in parallel without blocking the writer.
 
 ---
 
-## Architecture (Phase 1)
+## Architecture
 
 ```
-                       ┌─────────────────────────────────────┐
-   producer ──Append──►│           appendeventlog            │
-                       │      (producer-facing wrapper)      │
-                       └───────────────┬─────────────────────┘
-                                       │
-                       ┌───────────────▼─────────────────────┐
-                       │                wal                  │
-                       │  WALWriter: file + mutex + Index    │   events.log
-                       │  WALReader: own RO handle, ReadAt   │◄──────────────►  (disk)
-                       └───────────────▲─────────────────────┘
-                                       │
-                       ┌───────────────┴─────────────────────┐
-   consumer ──Next───► │            readeventlog             │
-                       │      (consumer-facing wrapper)      │
-                       └─────────────────────────────────────┘
+                     ┌─────────────────────────────────────┐
+   producer ─Append─►│           appendeventlog            │
+                     │      (producer-facing wrapper)      │
+                     └───────────────┬─────────────────────┘
+                                     │
+                     ┌───────────────▼─────────────────────┐
+                     │              segment                │
+                     │  Manager: ordered segments, active, │
+                     │           roll by size, route reads │     <dir>/
+                     │  Reader:  cross-segment Next() cursor│   ...0000.log
+                     └───────────────┬─────────────────────┘   ...1000.log
+                                     │  (each segment wraps a) ...2000.log
+                     ┌───────────────▼─────────────────────┐◄────────────► (disk)
+                     │                wal                  │
+                     │  WALWriter: file + mutex + Index    │
+                     │  WALReader: own RO handle, ReadAt   │
+                     └───────────────▲─────────────────────┘
+                                     │
+                     ┌───────────────┴─────────────────────┐
+   consumer ─Next───►│            readeventlog             │
+                     │      (consumer-facing wrapper)      │
+                     └─────────────────────────────────────┘
 
-   consumer ──commit─► consumeroffset  ──►  consumer-A.offset  (disk)
-                       (8-byte uint64: tmp + fsync + atomic rename + dir fsync)
+   consumer ─commit─► consumeroffset  ──►  consumer-A.offset  (disk)
+                      (8-byte uint64: tmp + fsync + atomic rename + dir fsync)
 ```
 
 ### Packages
 
 | Package | Responsibility |
 |---------|----------------|
-| `internal/wal` | Core engine: durable append (`WALWriter`) and positional read (`WALReader`). |
-| `internal/appendeventlog` | Producer-facing API: `Append([]byte) -> offset`. |
+| `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), CRC32C, recovery. |
+| `internal/segment` | Splits the log into base-offset segment files; `Manager` routes append/read + rolls, `Reader` is a cross-segment cursor. |
+| `internal/appendeventlog` | Producer-facing API: `Append([]byte) -> offset` over the segment manager. |
 | `internal/readeventlog`   | Consumer-facing API: `Next() -> data, offset` / `ReadAt(offset)`. |
 | `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery. |
-| `cmd`                     | Phase-1 demo wiring it all together. |
+| `cmd`, `cmd/concurrent`   | Demos wiring it all together. |
 
 ---
 
@@ -320,12 +368,14 @@ read in parallel without blocking the writer.
 go run ./cmd
 ```
 
-It appends five events, reads two as a consumer, commits its offset, simulates a
-**crash**, then restarts and **resumes from the committed offset**:
+It appends five events (rolling them across multiple segment files), reads two
+as a consumer, commits its offset, simulates a **crash**, then restarts and
+**resumes from the committed offset** — across segment boundaries:
 
 ```
   appended offset=0  event="user.signup"
   ...
+  (log spread across 3 segment files)
 -- consumer reads two events, commits, then crashes --
   read offset=0  event="user.signup"
   read offset=1  event="order.created"
@@ -338,23 +388,29 @@ It appends five events, reads two as a consumer, commits its offset, simulates a
   caught up — no more events
 ```
 
+A second demo, `go run ./cmd/concurrent`, runs many producers and consumers at
+once across segments, printing live consumer lag.
+
 ### Core API
 
 ```go
-// Producer
-p, _ := eventlog.NewEventLogAppend("events.log")
-offset, _ := p.Append([]byte("hello"))      // -> 0
+// Producer — open (or reopen) a segmented log in a directory.
+p, _ := eventlog.NewEventLogAppend(segment.Config{
+    Dir:             "mylog",
+    MaxSegmentBytes: 1 << 30, // roll to a new segment past 1 GiB
+})
+offset, _ := p.Append([]byte("hello"))       // -> 0
 
-// Consumer
-r, _ := readeventlog.NewReadEventLog("events.log", p.Writer())
-data, off, err := r.Next()                   // -> "hello", 0, nil
-//                                              io.EOF when caught up
+// Consumer — a cursor over the whole log, crossing segments transparently.
+r := readeventlog.NewReadEventLog(p.Manager())
+data, off, err := r.Next()                    // -> "hello", 0, nil
+//                                               io.EOF when caught up
 
 // Crash recovery
 ow := offset.NewOffsetWriter("consumer-A.offset")
-ow.Write(off + 1)                            // commit progress
+ow.Write(off + 1)                             // commit progress
 resume, _ := offset.NewOffsetReader("consumer-A.offset").Read()
-r.Seek(resume)                               // resume after restart
+r.Seek(resume)                                // resume after restart
 ```
 
 ---
@@ -369,14 +425,14 @@ deliberately pushed to their own phase.
 |-------|------|----------------------|
 | **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
 | **2 — Integrity** ✅ | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
-| **3 — Segments** ⏳ | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads. **Format unchanged.** | log segmentation, base offsets |
+| **3 — Segments** ✅ | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads. **Format unchanged.** | log segmentation, base offsets |
 | 4 — Retention | Delete segments whose last-append > configured age; never delete the active segment; loud stale-offset reset; per-segment last-append time (mtime fallback) | retention, time-based cleanup |
 | 5 — Optimizations | Single-write per record (len+crc+payload); reader/index decoupled; atomic/`RWMutex` index lookup; (measure single-read) | I/O batching, lock-free reads |
 | 6 — Sparse index | Store every Nth offset → position (not every one); seek + scan-forward | bounded index memory (Kafka-style) |
 | 7 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
 | 8 — Partitions & consumer groups | Many independent logs (e.g. per key/"account"), per-partition offsets, group coordination | horizontal scale, the rest of Kafka |
 
-> **Scope notes (things explicitly deferred so Phase 3 stays small):**
+> **Scope notes (things deliberately deferred to keep each phase to one idea):**
 > - **Retention → Phase 4.** Phase 3 only *creates* segments; deleting them is its own phase.
 > - **"Per-account folder" → Phase 8 (partitioning), NOT segmenting.** Segmenting = one log split into files. Partitioning = many independent logs keyed by something. The engine has no notion of an "account" yet.
 > - **Date-wise filenames → rejected.** We name segments by *base offset* (needed for offset lookup) and roll by *size*; date names conflict with both.
@@ -387,12 +443,16 @@ deliberately pushed to their own phase.
 ## Project layout
 
 ```
-cmd/main.go                                  # Phase-1 demo
+cmd/main.go                                  # single-flow demo (durable + CRC + segments)
+cmd/concurrent/main.go                       # many producers/consumers + lag metrics
 internal/
-  wal/wal_writer.go                          # durable append + recovery
-  wal/wal_reader.go                          # positional reads by offset
-  appendeventlog/append_event_log.go         # producer API
-  readeventlog/read_event_log.go             # consumer API
+  wal/wal_writer.go                          # per-file durable append + CRC + recovery
+  wal/wal_reader.go                          # per-file positional reads by offset
+  segment/segment.go                         # one segment = WALWriter + base offset
+  segment/manager.go                         # ordered segments, roll, route append/read
+  segment/reader.go                          # cross-segment Next() cursor
+  appendeventlog/append_event_log.go         # producer API (over segment manager)
+  readeventlog/read_event_log.go             # consumer API (over segment reader)
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
 ```

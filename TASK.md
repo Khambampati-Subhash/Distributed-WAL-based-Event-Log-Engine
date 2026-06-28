@@ -1,8 +1,11 @@
-# TASK.md — Phase 3: Segments only
+# TASK.md — Phase 3: Segments only ✅ DONE (tag: v3-segments)
 
-Phase 3 does **one thing**: split the single append-only file into multiple
+Phase 3 did **one thing**: split the single append-only file into multiple
 **segment files** in one directory. Retention, optimizations, and partitioning
-are explicitly deferred (see bottom) so this phase stays shippable.
+are explicitly deferred (see bottom) so this phase stayed shippable.
+
+**Status:** all 6 scope items complete, wired into the wrappers + both demos,
+`-race` green. Next up is Phase 4 (Retention).
 
 Record format is **unchanged** from Phase 2: `[len:4][crc:4][payload:N]`.
 A segment is just a *slice of the same log*, not a new format.
