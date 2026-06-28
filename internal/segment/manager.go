@@ -132,11 +132,15 @@ func (m *Manager) roll() error {
 
 // ReadAt returns the payload at the given global offset by routing to the
 // segment that owns it. Returns io.EOF if the offset has not been written yet.
+//
+// We hold the lock only long enough to pick the segment, then release it before
+// the (slow) disk read — so readers don't block the writer or each other on I/O.
+// The chosen Segment's own file handle is safe for concurrent positional reads.
 func (m *Manager) ReadAt(offset uint64) ([]byte, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	seg := m.segmentFor(offset)
+	m.mu.RUnlock()
+
 	if seg == nil {
 		return nil, io.EOF // beyond the end of the log (or below earliest)
 	}

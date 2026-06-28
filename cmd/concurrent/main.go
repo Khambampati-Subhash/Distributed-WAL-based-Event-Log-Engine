@@ -27,6 +27,7 @@ import (
 	eventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/appendeventlog"
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
 	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
 const (
@@ -46,9 +47,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	logPath := filepath.Join(dir, "events.log")
 
-	producer, err := eventlog.NewEventLogAppend(logPath)
+	// Small segment size so the concurrent run rolls across many segments,
+	// exercising cross-segment reads under load.
+	producer, err := eventlog.NewEventLogAppend(segment.Config{Dir: dir, MaxSegmentBytes: 256})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -98,7 +100,7 @@ func main() {
 		consumerWg.Add(1)
 		go func(idx int, spec consumerSpec) {
 			defer consumerWg.Done()
-			runConsumer(idx, spec, logPath, dir, producer, &consumed[idx], doneProducing)
+			runConsumer(idx, spec, dir, producer, &consumed[idx], doneProducing)
 		}(i, consumers[i])
 	}
 
@@ -135,19 +137,15 @@ func main() {
 func runConsumer(
 	idx int,
 	spec consumerSpec,
-	logPath, dir string,
+	dir string,
 	producer *eventlog.AppendEventlog,
 	live *atomic.Uint64,
 	doneProducing <-chan struct{},
 ) {
 	offsetPath := filepath.Join(dir, "consumer-"+spec.name+".offset")
 
-	// Each consumer gets its OWN reader (own file handle, own cursor).
-	reader, err := readeventlog.NewReadEventLog(logPath, producer.Writer())
-	if err != nil {
-		log.Printf("consumer %s: %v", spec.name, err)
-		return
-	}
+	// Each consumer gets its OWN reader (own cursor over the segmented log).
+	reader := readeventlog.NewReadEventLog(producer.Manager())
 	defer reader.Close()
 
 	// Resume from last committed offset (0 for a fresh consumer).

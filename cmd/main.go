@@ -1,10 +1,10 @@
-// Command main is a Phase-1 demo of the WAL-based event log engine.
+// Command main is a Phase-1/2/3 demo of the WAL-based event log engine.
 //
 // It runs entirely in-process (no network) and exercises every package:
-//   - append events to the durable log         (appendeventlog -> wal)
-//   - read them back by offset                 (readeventlog   -> wal)
-//   - a consumer commits its progress          (consumeroffset)
-//   - simulate a crash and resume from commit   (offset reader -> seek)
+//   - append events to the durable, segmented log  (appendeventlog -> segment -> wal)
+//   - read them back by offset, across segments     (readeventlog   -> segment)
+//   - a consumer commits its progress               (consumeroffset)
+//   - simulate a crash and resume from commit        (offset reader -> seek)
 package main
 
 import (
@@ -18,6 +18,7 @@ import (
 	eventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/appendeventlog"
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
 	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
 func main() {
@@ -27,11 +28,11 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 
-	logPath := filepath.Join(dir, "events.log")
 	offsetPath := filepath.Join(dir, "consumer-A.offset")
 
 	// ---- PRODUCER: append five events ----------------------------------
-	producer, err := eventlog.NewEventLogAppend(logPath)
+	// Tiny MaxSegmentBytes so this small demo visibly rolls into segments.
+	producer, err := eventlog.NewEventLogAppend(segment.Config{Dir: dir, MaxSegmentBytes: 32})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -43,13 +44,11 @@ func main() {
 		}
 		fmt.Printf("  appended offset=%d  event=%q\n", off, e)
 	}
+	fmt.Printf("  (log spread across %d segment files)\n", producer.Manager().SegmentCount())
 
 	// ---- CONSUMER (first run): read two, commit, then "crash" ----------
 	fmt.Println("\n-- consumer reads two events, commits, then crashes --")
-	reader, err := readeventlog.NewReadEventLog(logPath, producer.Writer())
-	if err != nil {
-		log.Fatal(err)
-	}
+	reader := readeventlog.NewReadEventLog(producer.Manager())
 	offsetWriter := offset.NewOffsetWriter(offsetPath)
 
 	var lastRead uint64
@@ -76,10 +75,7 @@ func main() {
 	}
 	fmt.Printf("  loaded committed offset=%d\n", resumeFrom)
 
-	reader2, err := readeventlog.NewReadEventLog(logPath, producer.Writer())
-	if err != nil {
-		log.Fatal(err)
-	}
+	reader2 := readeventlog.NewReadEventLog(producer.Manager())
 	defer reader2.Close()
 	reader2.Seek(resumeFrom)
 
@@ -98,5 +94,5 @@ func main() {
 	if err := producer.Close(); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("\nPhase-1 demo complete.")
+	fmt.Println("\nDemo complete (durable + CRC + segmented).")
 }

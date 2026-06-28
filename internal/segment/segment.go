@@ -33,10 +33,10 @@ const baseOffsetDigits = 20
 
 // Segment is one segment file plus the global base offset of its first record.
 type Segment struct {
-	baseOffset uint64          // global offset of the first record in this file
-	writer     *wal.WALWriter  // the underlying durable, CRC-checked file
-	reader     *wal.WALReader  // read handle into the same file
-	path       string          // full path to the .log file
+	baseOffset uint64         // global offset of the first record in this file
+	writer     *wal.WALWriter // the underlying durable, CRC-checked file
+	reader     *wal.WALReader // read handle into the same file
+	path       string         // full path to the .log file
 }
 
 // SegmentFileName returns the canonical filename for a segment with the given
