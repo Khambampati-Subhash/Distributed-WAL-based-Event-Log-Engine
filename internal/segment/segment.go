@@ -19,7 +19,10 @@ package segment
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/wal"
 )
@@ -37,6 +40,15 @@ type Segment struct {
 	writer     *wal.WALWriter // the underlying durable, CRC-checked file
 	reader     *wal.WALReader // read handle into the same file
 	path       string         // full path to the .log file
+
+	// Retention (Phase 4) state:
+	mu         sync.Mutex // guards lastAppend
+	lastAppend time.Time  // wall-clock time of the most recent append; used
+	//                           to decide when the whole segment ages out.
+	//                           Initialized from file mtime on open, then updated
+	//                           to the current time on each append.
+	readers sync.WaitGroup // in-flight readers; retention waits for this to drain
+	//                        before closing+deleting the file (fd/unlink safety)
 }
 
 // SegmentFileName returns the canonical filename for a segment with the given
@@ -60,11 +72,21 @@ func NewSegment(dir string, baseOffset uint64) (*Segment, error) {
 		return nil, err
 	}
 
+	// Seed lastAppend from the file's mtime (cold-start fallback). While the
+	// engine runs, Append updates it to the current time; but after a restart
+	// our in-memory time is gone, so the file's mtime is the best proxy for
+	// "when was this segment last written".
+	lastAppend := time.Now()
+	if info, statErr := os.Stat(path); statErr == nil {
+		lastAppend = info.ModTime()
+	}
+
 	return &Segment{
 		baseOffset: baseOffset,
 		writer:     writer,
 		reader:     reader,
 		path:       path,
+		lastAppend: lastAppend,
 	}, nil
 }
 
@@ -90,17 +112,41 @@ func (s *Segment) Contains(globalOffset uint64) bool {
 }
 
 // Append writes one opaque record and returns the GLOBAL offset it was stored
-// at (baseOffset + local slot).
-func (s *Segment) Append(data []byte) (uint64, error) {
+// at (baseOffset + local slot). now is the current wall-clock time (injected so
+// tests can control segment age); it becomes this segment's last-append time.
+func (s *Segment) Append(data []byte, now time.Time) (uint64, error) {
 	localSlot, err := s.writer.Write(data)
 	if err != nil {
 		return 0, err
 	}
+	s.mu.Lock()
+	s.lastAppend = now
+	s.mu.Unlock()
 	return s.baseOffset + localSlot, nil
 }
 
+// LastAppend returns the wall-clock time of the most recent append (or, after a
+// cold start with no appends yet, the file's mtime). Retention compares this
+// against the retention window to decide if the whole segment has aged out.
+func (s *Segment) LastAppend() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAppend
+}
+
+// acquireRead marks a reader as in-flight so retention won't Close() the file
+// out from under it. MUST be called by the manager while holding the manager
+// lock, so it is atomic with the segment still being a member of the live set.
+// The caller must call releaseRead when done.
+func (s *Segment) acquireRead() { s.readers.Add(1) }
+
+// releaseRead marks an in-flight reader as finished.
+func (s *Segment) releaseRead() { s.readers.Done() }
+
 // ReadAt returns the payload at the given GLOBAL offset. It translates the
-// global offset to this segment's local slot before reading.
+// global offset to this segment's local slot before reading. The caller is
+// responsible for having acquired a read reference (see acquireRead) so the
+// underlying file is not closed mid-read.
 func (s *Segment) ReadAt(globalOffset uint64) ([]byte, error) {
 	if globalOffset < s.baseOffset {
 		return nil, fmt.Errorf("segment: offset %d below base %d", globalOffset, s.baseOffset)
@@ -108,6 +154,14 @@ func (s *Segment) ReadAt(globalOffset uint64) ([]byte, error) {
 	localSlot := globalOffset - s.baseOffset
 	return s.reader.ReadAt(localSlot)
 }
+
+// waitReaders blocks until all in-flight readers have released. Retention calls
+// this AFTER detaching the segment from the live set (so no new readers can
+// acquire it) and BEFORE Close()+Remove(), guaranteeing no read is cut off.
+func (s *Segment) waitReaders() { s.readers.Wait() }
+
+// Path returns the segment file's full path (used by retention to delete it).
+func (s *Segment) Path() string { return s.path }
 
 // Close releases the segment's file handles.
 func (s *Segment) Close() error {

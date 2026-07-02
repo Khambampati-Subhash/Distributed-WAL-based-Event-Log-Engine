@@ -27,6 +27,11 @@ func (r *Reader) ReadAt(offset uint64) ([]byte, error) {
 // Next returns the record at the cursor and advances by one, plus the offset
 // that was read (so the consumer can persist progress). Returns io.EOF when
 // caught up to the head of the log. Crossing a segment boundary is automatic.
+//
+// If the cursor has fallen behind the retention window (the data it wanted was
+// deleted), Next returns an *OffsetOutOfRetentionError WITHOUT advancing. The
+// caller can inspect it, then call Reset()/Seek() to skip to the earliest
+// available offset — the reset is loud, so the consumer knows it lost data.
 func (r *Reader) Next() (data []byte, offset uint64, err error) {
 	data, err = r.m.ReadAt(r.offset)
 	if err != nil {
@@ -35,6 +40,15 @@ func (r *Reader) Next() (data []byte, offset uint64, err error) {
 	offset = r.offset
 	r.offset++
 	return data, offset, nil
+}
+
+// ResetToEarliest moves the cursor to the earliest available offset and returns
+// it. A consumer calls this after Next() reports *OffsetOutOfRetentionError to
+// deliberately (and knowingly) skip the deleted data and resume from the front.
+func (r *Reader) ResetToEarliest() uint64 {
+	earliest := r.m.EarliestOffset()
+	r.offset = earliest
+	return earliest
 }
 
 // Seek moves the cursor so the next Next() starts at the given global offset.

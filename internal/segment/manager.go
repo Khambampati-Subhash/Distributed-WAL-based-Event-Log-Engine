@@ -3,21 +3,77 @@ package segment
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-// DefaultMaxSegmentBytes is the roll threshold if Config leaves it unset.
-const DefaultMaxSegmentBytes = 1 << 30 // 1 GiB
+// Defaults applied when Config leaves a field unset.
+const (
+	DefaultMaxSegmentBytes  = 1 << 30 // 1 GiB
+	DefaultRetention        = 7 * 24 * time.Hour
+	DefaultCheckInterval    = 1 * time.Minute
+	DefaultMaxDeletesPerRun = 0 // 0 == unlimited
+)
 
 // Config controls the log directory and segment behavior. It is set once at
 // startup (the user configures it when constructing the manager).
 type Config struct {
 	Dir             string // directory holding the .log segment files
 	MaxSegmentBytes int64  // roll to a new segment once the active one exceeds this
+
+	// Retention (Phase 4). Zero values fall back to the Default* constants.
+	Retention        time.Duration // delete segments whose last-append is older than this
+	CheckInterval    time.Duration // how often the retention goroutine runs
+	MaxDeletesPerRun int           // cap deletes per run (0 = unlimited) to smooth I/O
+	DisableRetention bool          // if true, no background retention goroutine starts
+
+	// clock is injectable for deterministic tests; nil means time.Now.
+	clock func() time.Time
+}
+
+func (c *Config) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
+}
+
+// WithClock sets an injectable time source (for demos/tests that need to
+// control segment age without waiting real time). Returns the config for
+// chaining. In production, leave it unset and time.Now is used.
+func (c Config) WithClock(clock func() time.Time) Config {
+	c.clock = clock
+	return c
+}
+
+// RetentionMetrics holds counters an operator can inspect to see whether
+// retention is healthy (all fields read/written atomically).
+type RetentionMetrics struct {
+	SegmentsDeleted atomic.Int64 // total segments successfully removed
+	BytesReclaimed  atomic.Int64 // total bytes freed
+	DeleteErrors    atomic.Int64 // failed os.Remove attempts (the "something's wrong" signal)
+	Runs            atomic.Int64 // how many times the retention loop has run
+	LastRunUnixNano atomic.Int64 // wall-clock of the last run (liveness)
+}
+
+// OffsetOutOfRetentionError means the requested offset was already deleted by
+// retention — the consumer fell behind the retention window. It carries the
+// earliest offset still available so the caller can reset to it (loudly, not
+// silently: the caller KNOWS it skipped Earliest-Requested records).
+type OffsetOutOfRetentionError struct {
+	Requested uint64 // the offset the consumer asked for
+	Earliest  uint64 // the earliest offset still stored
+}
+
+func (e *OffsetOutOfRetentionError) Error() string {
+	return fmt.Sprintf("segment: offset %d out of retention; earliest available is %d (skipped %d records)",
+		e.Requested, e.Earliest, e.Earliest-e.Requested)
 }
 
 // Manager owns the ordered set of segments that together form one logical log.
@@ -28,6 +84,12 @@ type Manager struct {
 	mu       sync.RWMutex // guards segments + active; RWMutex so reads don't serialize
 	cfg      Config
 	segments []*Segment // ordered by base offset; last element is active
+
+	Metrics RetentionMetrics // observability for the retention loop
+
+	stop     chan struct{}  // closed by Close() to stop the retention goroutine
+	stopOnce sync.Once      // ensures the stop channel is closed at most once
+	wg       sync.WaitGroup // waits for the retention goroutine to exit on Close()
 }
 
 // Open creates or reopens a segmented log in cfg.Dir. It discovers any existing
@@ -38,11 +100,17 @@ func Open(cfg Config) (*Manager, error) {
 	if cfg.MaxSegmentBytes <= 0 {
 		cfg.MaxSegmentBytes = DefaultMaxSegmentBytes
 	}
+	if cfg.Retention <= 0 {
+		cfg.Retention = DefaultRetention
+	}
+	if cfg.CheckInterval <= 0 {
+		cfg.CheckInterval = DefaultCheckInterval
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("segment: mkdir %q: %w", cfg.Dir, err)
 	}
 
-	m := &Manager{cfg: cfg}
+	m := &Manager{cfg: cfg, stop: make(chan struct{})}
 
 	bases, err := discoverBaseOffsets(cfg.Dir)
 	if err != nil {
@@ -56,18 +124,22 @@ func Open(cfg Config) (*Manager, error) {
 			return nil, err
 		}
 		m.segments = []*Segment{seg}
-		return m, nil
+	} else {
+		// Reopen every existing segment in base-offset order; each rebuilds its
+		// own index from disk. The last one (highest base) becomes active.
+		for _, base := range bases {
+			seg, err := NewSegment(cfg.Dir, base)
+			if err != nil {
+				m.closeAll()
+				return nil, err
+			}
+			m.segments = append(m.segments, seg)
+		}
 	}
 
-	// Reopen every existing segment in base-offset order; each rebuilds its
-	// own index from disk. The last one (highest base) becomes active.
-	for _, base := range bases {
-		seg, err := NewSegment(cfg.Dir, base)
-		if err != nil {
-			m.closeAll()
-			return nil, err
-		}
-		m.segments = append(m.segments, seg)
+	if !cfg.DisableRetention {
+		m.wg.Add(1)
+		go m.retentionLoop()
 	}
 	return m, nil
 }
@@ -115,7 +187,7 @@ func (m *Manager) Append(data []byte) (uint64, error) {
 			return 0, err
 		}
 	}
-	return m.active().Append(data)
+	return m.active().Append(data, m.cfg.now())
 }
 
 // roll seals the active segment and starts a new one whose base offset is the
@@ -139,11 +211,27 @@ func (m *Manager) roll() error {
 func (m *Manager) ReadAt(offset uint64) ([]byte, error) {
 	m.mu.RLock()
 	seg := m.segmentFor(offset)
+	if seg != nil {
+		// Acquire a read reference while still holding the lock, so it is
+		// atomic with the segment being a live member. Retention detaches
+		// under the same lock and then waits for readers to drain, so it can
+		// never Close() this file while we hold the reference.
+		seg.acquireRead()
+	}
+	earliest := m.segments[0].BaseOffset()
 	m.mu.RUnlock()
 
 	if seg == nil {
-		return nil, io.EOF // beyond the end of the log (or below earliest)
+		// Two very different "no segment" cases:
+		if offset < earliest {
+			// The data this consumer wants was already DELETED by retention.
+			// This is NOT "caught up" — the consumer fell behind the window.
+			// Surface it loudly so the caller can reset (see ErrOffsetOutOfRetention).
+			return nil, &OffsetOutOfRetentionError{Requested: offset, Earliest: earliest}
+		}
+		return nil, io.EOF // offset is at/beyond the head: legitimately nothing yet
 	}
+	defer seg.releaseRead()
 	return seg.ReadAt(offset)
 }
 
@@ -190,8 +278,90 @@ func (m *Manager) SegmentCount() int {
 	return len(m.segments)
 }
 
-// Close closes every segment.
+// retentionLoop runs in the background, deleting aged-out segments on a ticker
+// until Close() stops it. Each tick runs one RunRetention pass.
+func (m *Manager) retentionLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(m.cfg.CheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			m.RunRetention()
+		}
+	}
+}
+
+// RunRetention performs one retention pass: delete every segment whose data has
+// aged past cfg.Retention, oldest-first, but never the active segment. It is
+// exported so tests can trigger a deterministic pass without waiting for the
+// ticker. Safe to call concurrently with Append/ReadAt.
+//
+// The work is split in two phases to avoid blocking the core:
+//
+//	Phase A (fast, under lock): decide which segments are victims and DETACH
+//	  them from the live slice — pure in-memory pointer surgery.
+//	Phase B (slow, NO lock):    wait for in-flight readers to drain, then
+//	  Close()+os.Remove() each victim. Disk I/O happens with the lock released,
+//	  so producers/consumers are never blocked on deletion.
+func (m *Manager) RunRetention() {
+	m.Metrics.Runs.Add(1)
+	m.Metrics.LastRunUnixNano.Store(m.cfg.now().UnixNano())
+
+	cutoff := m.cfg.now().Add(-m.cfg.Retention)
+
+	// ---- Phase A: decide + detach (fast, under lock) ----
+	m.mu.Lock()
+	// Segments are ordered oldest-first; the active (last) segment is never a
+	// victim. Walk the prefix and collect those whose last-append < cutoff.
+	// Stop at the first segment that is NOT expired: because segments are
+	// append-time ordered, nothing after a live segment can be older.
+	var victims []*Segment
+	limit := m.cfg.MaxDeletesPerRun
+	for i := 0; i < len(m.segments)-1; i++ { // len-1 => never the active segment
+		seg := m.segments[i]
+		if seg.LastAppend().After(cutoff) {
+			break // this and all later segments are still within the window
+		}
+		if limit > 0 && len(victims) >= limit {
+			break // respect the per-run cap to smooth I/O
+		}
+		victims = append(victims, seg)
+	}
+	if len(victims) > 0 {
+		// Detach the victim prefix in one shot; readers can no longer route to them.
+		m.segments = m.segments[len(victims):]
+	}
+	m.mu.Unlock()
+
+	// ---- Phase B: act (slow, NO lock held) ----
+	for _, seg := range victims {
+		seg.waitReaders() // let any in-flight ReadAt finish (no read is cut off)
+		size := seg.Size()
+		if err := seg.Close(); err != nil {
+			m.Metrics.DeleteErrors.Add(1)
+			log.Printf("segment: retention close %s: %v", seg.Path(), err)
+			continue
+		}
+		if err := os.Remove(seg.Path()); err != nil {
+			m.Metrics.DeleteErrors.Add(1)
+			log.Printf("segment: retention remove %s: %v", seg.Path(), err)
+			// Already detached from memory; a restart's discovery will re-find
+			// this file and retention will retry it then.
+			continue
+		}
+		m.Metrics.SegmentsDeleted.Add(1)
+		m.Metrics.BytesReclaimed.Add(size)
+	}
+}
+
+// Close stops the retention goroutine and closes every segment.
 func (m *Manager) Close() error {
+	m.stopOnce.Do(func() { close(m.stop) })
+	m.wg.Wait() // ensure retention isn't mutating segments while we close them
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closeAll()
