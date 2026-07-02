@@ -98,12 +98,91 @@ a segment, a record's position is **local** (its slot within that one file):
 global offset  ──(find owning segment)──►  local slot = global − baseOffset
 ```
 
-This indirection is what makes deleting old segments safe later (Phase 4
-retention): offsets are no longer a single dense array from 0, they're keyed by
-each segment's base offset. The `SegmentManager` owns the ordered segments,
-routes `Append` to the active one, and routes each read to the segment that owns
-that offset. A consumer `Reader` walks the whole log with `Next()`, crossing
-segment boundaries transparently.
+This indirection is what makes deleting old segments safe (see Retention below):
+offsets are no longer a single dense array from 0, they're keyed by each
+segment's base offset. The `SegmentManager` owns the ordered segments, routes
+`Append` to the active one, and routes each read to the segment that owns that
+offset. A consumer `Reader` walks the whole log with `Next()`, crossing segment
+boundaries transparently.
+
+---
+
+## Retention (Phase 4)
+
+Segments let old data be deleted; retention pulls the trigger. A background
+goroutine periodically deletes segments whose data has aged past a configured
+window (default 7 days), reclaiming disk. Without this, an append-only log grows
+until the disk fills — a guaranteed outage, not a slowdown.
+
+```go
+segment.Config{
+    Dir:              "mylog",
+    MaxSegmentBytes:  1 << 30,             // roll size
+    Retention:        7 * 24 * time.Hour,  // delete segments older than this
+    CheckInterval:    1 * time.Minute,     // how often to check
+    MaxDeletesPerRun: 0,                   // 0 = unlimited (throttle if needed)
+}
+```
+
+### You delete segments, not records
+
+An append-only file has no "delete row". Retention deletes **whole segment
+files**, and only when **every record in the segment** is past the window. So a
+record's lifetime is **"at least 7 days," never "exactly 7 days"** — it survives
+until the entire segment it lives in ages out. The rule is *"delete segments
+whose last-append is older than the window,"* not *"delete records older than
+the window."* (Kafka behaves identically — `retention.ms` is a floor.)
+
+### Age = per-segment last-append time
+
+Each segment tracks the wall-clock time of its most recent append. On a cold
+start (in-memory state gone) it falls back to the file's mtime. A segment is
+eligible for deletion when `now - lastAppend > Retention`. The **active segment
+is never deleted** — we're still writing to it.
+
+### The core rule: hold locks for memory, never across I/O
+
+Deleting thousands of files must not freeze producers and consumers. So each
+retention pass is split in two:
+
+```
+Phase A — decide + detach   (FAST, under lock, microseconds)
+    pick victims (aged, non-active), splice them out of the segments slice
+Phase B — act               (SLOW, NO lock held)
+    for each victim: wait for in-flight readers, Close(), os.Remove(), record metrics
+```
+
+The lock protects the *data structure*, not the *disk operation*. The core
+thread blocks only for the tiny in-memory detach, never for the deletes.
+
+### No read is ever cut off (reader refcount)
+
+A reader might be mid-read on a segment retention wants to delete. Each segment
+carries an in-flight **reader refcount**: `ReadAt` acquires it *under the manager
+lock* (atomic with the segment being live), and retention — after detaching the
+segment so no *new* reader can find it — **waits for the refcount to drain**
+before `Close()`+`Remove()`. An in-flight read always completes.
+
+### Falling behind is loud, not silent
+
+If a slow consumer's committed offset points into a segment that was already
+deleted, reading it returns a typed `*OffsetOutOfRetentionError` (carrying the
+earliest surviving offset and how many records were skipped) — **not** a silent
+`io.EOF` that would masquerade as "caught up". The consumer calls
+`ResetToEarliest()` to knowingly skip the lost data and resume. (This is the same
+philosophy as CRC: never silently hide the fact that data is gone.)
+
+### Observability
+
+`Manager.Metrics` exposes atomic counters so an operator can tell retention is
+healthy: `SegmentsDeleted`, `BytesReclaimed`, `DeleteErrors` (the "something's
+wrong" signal), `Runs`, and `LastRunUnixNano` (liveness). A failed `os.Remove`
+increments `DeleteErrors` and is logged; the segment was already detached from
+memory, so the next startup re-discovers and retries it.
+
+Run `go run ./cmd/retention` to see it: events roll into segments, the clock
+jumps past the window, retention deletes the old segments, and a stale consumer
+gets the loud reset.
 
 ---
 
@@ -426,14 +505,13 @@ deliberately pushed to their own phase.
 | **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
 | **2 — Integrity** ✅ | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
 | **3 — Segments** ✅ | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads. **Format unchanged.** | log segmentation, base offsets |
-| 4 — Retention | Delete segments whose last-append > configured age; never delete the active segment; loud stale-offset reset; per-segment last-append time (mtime fallback) | retention, time-based cleanup |
+| **4 — Retention** ✅ | Background deletion of aged segments (never the active one); decide-under-lock/act-outside-lock; reader refcount so no read is cut off; loud `OffsetOutOfRetentionError` reset; per-segment last-append time (mtime fallback); metrics | retention, background cleanup, lock-vs-I/O discipline |
 | 5 — Optimizations | Single-write per record (len+crc+payload); reader/index decoupled; atomic/`RWMutex` index lookup; (measure single-read) | I/O batching, lock-free reads |
 | 6 — Sparse index | Store every Nth offset → position (not every one); seek + scan-forward | bounded index memory (Kafka-style) |
 | 7 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
 | 8 — Partitions & consumer groups | Many independent logs (e.g. per key/"account"), per-partition offsets, group coordination | horizontal scale, the rest of Kafka |
 
 > **Scope notes (things deliberately deferred to keep each phase to one idea):**
-> - **Retention → Phase 4.** Phase 3 only *creates* segments; deleting them is its own phase.
 > - **"Per-account folder" → Phase 8 (partitioning), NOT segmenting.** Segmenting = one log split into files. Partitioning = many independent logs keyed by something. The engine has no notion of an "account" yet.
 > - **Date-wise filenames → rejected.** We name segments by *base offset* (needed for offset lookup) and roll by *size*; date names conflict with both.
 > - **Single-read / atomic index → Phase 5.** Deferred because segments rewrite the very index code those optimizations target — optimizing it first would be polishing code we're about to replace.
@@ -445,12 +523,13 @@ deliberately pushed to their own phase.
 ```
 cmd/main.go                                  # single-flow demo (durable + CRC + segments)
 cmd/concurrent/main.go                       # many producers/consumers + lag metrics
+cmd/retention/main.go                        # retention: age out segments + loud reset
 internal/
   wal/wal_writer.go                          # per-file durable append + CRC + recovery
   wal/wal_reader.go                          # per-file positional reads by offset
-  segment/segment.go                         # one segment = WALWriter + base offset
-  segment/manager.go                         # ordered segments, roll, route append/read
-  segment/reader.go                          # cross-segment Next() cursor
+  segment/segment.go                         # one segment = WALWriter + base offset + refcount
+  segment/manager.go                         # ordered segments, roll, route, retention loop
+  segment/reader.go                          # cross-segment Next() cursor + reset
   appendeventlog/append_event_log.go         # producer API (over segment manager)
   readeventlog/read_event_log.go             # consumer API (over segment reader)
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic)

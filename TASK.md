@@ -1,11 +1,17 @@
-# TASK.md — Phase 3: Segments only ✅ DONE (tag: v3-segments)
+# TASK.md — Phases 3 & 4 ✅ DONE
 
-Phase 3 did **one thing**: split the single append-only file into multiple
-**segment files** in one directory. Retention, optimizations, and partitioning
-are explicitly deferred (see bottom) so this phase stayed shippable.
+**Phase 3 (segments)** — tag `v3-segments`: split the single file into base-offset
+segment files, roll by size, per-segment index, startup discovery, cross-segment
+reads. Wired into wrappers + demos, `-race` green.
 
-**Status:** all 6 scope items complete, wired into the wrappers + both demos,
-`-race` green. Next up is Phase 4 (Retention).
+**Phase 4 (retention)** — tag `v4-retention`: background goroutine deletes aged
+segments (never the active one) using decide-under-lock / act-outside-lock; a
+per-segment reader refcount guarantees no in-flight read is cut off; a slow
+consumer whose offset was deleted gets a loud `*OffsetOutOfRetentionError` and
+can `ResetToEarliest()`; per-segment last-append time (mtime cold-start fallback);
+`Metrics` counters (deleted / bytesReclaimed / deleteErrors / runs). Retention
+demo in `cmd/retention`, all `-race` green including a concurrent delete-vs-read
+stress test. **Next up: Phase 5 (optimizations).**
 
 Record format is **unchanged** from Phase 2: `[len:4][crc:4][payload:N]`.
 A segment is just a *slice of the same log*, not a new format.
