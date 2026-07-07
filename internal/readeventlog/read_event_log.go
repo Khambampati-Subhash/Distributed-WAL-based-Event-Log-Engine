@@ -14,8 +14,8 @@ type ReadEventLog struct {
 
 // NewReadEventLog opens a consumer cursor over the segmented log managed by mgr.
 // The cursor starts at the earliest available offset.
-func NewReadEventLog(mgr *segment.Manager) *ReadEventLog {
-	return &ReadEventLog{reader: mgr.NewReader()}
+func NewReadEventLog(mgr segment.ManagerInterface) *ReadEventLog {
+	return &ReadEventLog{reader: segment.NewReader(mgr)}
 }
 
 // ReadAt returns the event stored at the given global offset (io.EOF if not

@@ -10,13 +10,13 @@ package segment
 // The underlying Manager.ReadAt is concurrent-safe, so many Readers may run at
 // once alongside an appending producer.
 type Reader struct {
-	m      *Manager
+	m      ManagerInterface
 	offset uint64 // next global offset Next() will return
 }
 
 // NewReader returns a fresh cursor positioned at the earliest available offset.
-func (m *Manager) NewReader() *Reader {
-	return &Reader{m: m, offset: m.EarliestOffset()}
+func NewReader(manager ManagerInterface) *Reader {
+	return &Reader{m: manager, offset: manager.EarliestOffset()}
 }
 
 // ReadAt returns the payload at an absolute global offset (stateless).

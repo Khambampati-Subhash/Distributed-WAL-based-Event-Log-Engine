@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	eventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/appendeventlog"
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
 	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
@@ -50,7 +49,7 @@ func main() {
 
 	// Small segment size so the concurrent run rolls across many segments,
 	// exercising cross-segment reads under load.
-	producer, err := eventlog.NewEventLogAppend(segment.Config{Dir: dir, MaxSegmentBytes: 256})
+	producer, err := segment.Open(segment.Config{Dir: dir, MaxSegmentBytes: 256})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -138,14 +137,14 @@ func runConsumer(
 	idx int,
 	spec consumerSpec,
 	dir string,
-	producer *eventlog.AppendEventlog,
+	producer segment.ManagerInterface,
 	live *atomic.Uint64,
 	doneProducing <-chan struct{},
 ) {
 	offsetPath := filepath.Join(dir, "consumer-"+spec.name+".offset")
 
 	// Each consumer gets its OWN reader (own cursor over the segmented log).
-	reader := readeventlog.NewReadEventLog(producer.Manager())
+	reader := readeventlog.NewReadEventLog(producer)
 	defer reader.Close()
 
 	// Resume from last committed offset (0 for a fresh consumer).
@@ -187,7 +186,7 @@ func runConsumer(
 	}
 }
 
-func printMetrics(producer *eventlog.AppendEventlog, produced *int64, specs []consumerSpec, consumed []atomic.Uint64) {
+func printMetrics(producer segment.ManagerInterface, produced *int64, specs []consumerSpec, consumed []atomic.Uint64) {
 	head := producer.NextOffset()
 	line := fmt.Sprintf("[metrics] produced=%2d head=%2d", atomic.LoadInt64(produced), head)
 	for i, s := range specs {

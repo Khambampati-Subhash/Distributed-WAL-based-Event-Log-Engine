@@ -60,6 +60,14 @@ type WALWriter struct {
 	size  int64        // current file size in bytes (tracked in-memory, no stat per write)
 }
 
+type WALWriterInterface interface {
+	Write(data []byte) (uint64, error)
+	Size() int64
+	PositionOf(offset uint64) (int64, bool)
+	NextOffset() uint64
+	Close() error
+}
+
 // NewWalWriter opens (or creates) the log file and rebuilds the in-memory
 // index from whatever is already on disk, so the log survives a restart.
 func NewWalWriter(filename string) (*WALWriter, error) {

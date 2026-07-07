@@ -145,7 +145,7 @@ func TestStaleOffsetLoudReset(t *testing.T) {
 	}
 
 	// A consumer still sitting at offset 0 must get a LOUD error, not io.EOF.
-	r := m.NewReader()
+	r := NewReader(m)
 	r.Seek(0)
 	_, _, err = r.Next()
 	var oore *OffsetOutOfRetentionError

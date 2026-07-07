@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 
-	eventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/appendeventlog"
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
 	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
@@ -32,7 +31,7 @@ func main() {
 
 	// ---- PRODUCER: append five events ----------------------------------
 	// Tiny MaxSegmentBytes so this small demo visibly rolls into segments.
-	producer, err := eventlog.NewEventLogAppend(segment.Config{Dir: dir, MaxSegmentBytes: 32})
+	producer, err := segment.Open(segment.Config{Dir: dir, MaxSegmentBytes: 256})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,11 +43,11 @@ func main() {
 		}
 		fmt.Printf("  appended offset=%d  event=%q\n", off, e)
 	}
-	fmt.Printf("  (log spread across %d segment files)\n", producer.Manager().SegmentCount())
+	fmt.Printf("  (log spread across %d segment files)\n", producer.SegmentCount())
 
 	// ---- CONSUMER (first run): read two, commit, then "crash" ----------
 	fmt.Println("\n-- consumer reads two events, commits, then crashes --")
-	reader := readeventlog.NewReadEventLog(producer.Manager())
+	reader := readeventlog.NewReadEventLog(producer)
 	offsetWriter := offset.NewOffsetWriter(offsetPath)
 
 	var lastRead uint64
@@ -75,7 +74,7 @@ func main() {
 	}
 	fmt.Printf("  loaded committed offset=%d\n", resumeFrom)
 
-	reader2 := readeventlog.NewReadEventLog(producer.Manager())
+	reader2 := readeventlog.NewReadEventLog(producer)
 	defer reader2.Close()
 	reader2.Seek(resumeFrom)
 

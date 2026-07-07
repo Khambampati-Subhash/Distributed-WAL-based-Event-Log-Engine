@@ -92,6 +92,18 @@ type Manager struct {
 	wg       sync.WaitGroup // waits for the retention goroutine to exit on Close()
 }
 
+type ManagerInterface interface {
+	active() *Segment
+	Append(data []byte) (uint64, error)
+	roll() error
+	ReadAt(offset uint64) ([]byte, error)
+	NextOffset() uint64
+	EarliestOffset() uint64
+	SegmentCount() int
+	Close() error
+	RunRetention()
+}
+
 // Open creates or reopens a segmented log in cfg.Dir. It discovers any existing
 // segment files, rebuilds their indexes (CRC-verified, via the WAL layer), and
 // marks the highest-base segment active. An empty/new directory starts with a

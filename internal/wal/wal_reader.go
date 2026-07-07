@@ -20,15 +20,15 @@ import (
 // the index slice can be reallocated by an in-flight append; but the lock is
 // released before the (slow) disk read happens.
 type WALReader struct {
-	writer *WALWriter   // source of the offset -> byte-position index
-	file   *os.File     // own read-only handle; safe for concurrent ReadAt
-	offset uint64       // cursor: the next offset Read() will return
-	table  *crc32.Table // CRC32C polynomial, for verifying reads
+	writer WALWriterInterface // source of the offset -> byte-position index
+	file   *os.File           // own read-only handle; safe for concurrent ReadAt
+	offset uint64             // cursor: the next offset Read() will return
+	table  *crc32.Table       // CRC32C polynomial, for verifying reads
 }
 
 // NewWALReader opens a read-only handle to the same log file the writer owns.
 // The writer is passed in so the reader can translate offsets into positions.
-func NewWALReader(filename string, writer *WALWriter) (*WALReader, error) {
+func NewWALReader(filename string, writer WALWriterInterface) (*WALReader, error) {
 	file, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open for read %q: %w", filename, err)
