@@ -147,15 +147,14 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 	var crcBuf [crcSize]byte
 	binary.BigEndian.PutUint32(crcBuf[:], crcChecksum)
 
+	var totalBytes []byte
+	totalBytes = append(totalBytes, lenBuf[:]...)
+	totalBytes = append(totalBytes, crcBuf[:]...)
+	totalBytes = append(totalBytes, data[:]...)
+
 	// Write: [ len:4 ][ crc:4 ][ payload:N ]
-	if _, err := w.File.Write(lenBuf[:]); err != nil {
-		return 0, fmt.Errorf("wal: write length: %w", err)
-	}
-	if _, err := w.File.Write(crcBuf[:]); err != nil {
-		return 0, fmt.Errorf("wal: write crc: %w", err)
-	}
-	if _, err := w.File.Write(data); err != nil {
-		return 0, fmt.Errorf("wal: write payload: %w", err)
+	if _, err := w.File.Write(totalBytes); err != nil {
+		return 0, fmt.Errorf("wal: write header + crc + total payload: %w", err)
 	}
 
 	// fsync — data is only durable after this returns.
