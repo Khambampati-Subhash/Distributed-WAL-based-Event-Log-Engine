@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
-	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
@@ -47,7 +46,7 @@ func main() {
 
 	// ---- CONSUMER (first run): read two, commit, then "crash" ----------
 	fmt.Println("\n-- consumer reads two events, commits, then crashes --")
-	reader := readeventlog.NewReadEventLog(producer)
+	reader := segment.NewReader(producer)
 	offsetWriter := offset.NewOffsetWriter(offsetPath)
 
 	var lastRead uint64
@@ -74,7 +73,7 @@ func main() {
 	}
 	fmt.Printf("  loaded committed offset=%d\n", resumeFrom)
 
-	reader2 := readeventlog.NewReadEventLog(producer)
+	reader2 := segment.NewReader(producer)
 	defer reader2.Close()
 	reader2.Seek(resumeFrom)
 

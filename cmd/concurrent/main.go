@@ -25,7 +25,6 @@ import (
 	"time"
 
 	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
-	readeventlog "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/readeventlog"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
@@ -144,7 +143,7 @@ func runConsumer(
 	offsetPath := filepath.Join(dir, "consumer-"+spec.name+".offset")
 
 	// Each consumer gets its OWN reader (own cursor over the segmented log).
-	reader := readeventlog.NewReadEventLog(producer)
+	reader := segment.NewReader(producer)
 	defer reader.Close()
 
 	// Resume from last committed offset (0 for a fresh consumer).
