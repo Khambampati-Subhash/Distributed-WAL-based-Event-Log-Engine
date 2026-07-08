@@ -32,6 +32,7 @@ func (c *fakeClock) Now() time.Time {
 	defer c.mu.Unlock()
 	return c.now
 }
+
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -85,7 +86,7 @@ func main() {
 
 	// ---- a consumer still at offset 0 fell behind: LOUD reset, not silent EOF ----
 	fmt.Println("\na slow consumer still sitting at offset 0 tries to read...")
-	r := m.NewReader()
+	r := segment.NewReader(m)
 	r.Seek(0)
 	_, _, err = r.Next()
 	var oore *segment.OffsetOutOfRetentionError

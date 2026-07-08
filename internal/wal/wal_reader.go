@@ -60,18 +60,13 @@ func (r *WALReader) ReadAt(offset uint64) ([]byte, error) {
 	}
 
 	// 2. Read the length field (4 bytes).
-	lenBuf := make([]byte, lengthSize)
+	lenBuf := make([]byte, lengthSize+crcSize)
 	if _, err := r.file.ReadAt(lenBuf, pos); err != nil {
-		return nil, fmt.Errorf("wal: read length at offset %d (pos %d): %w", offset, pos, err)
+		return nil, fmt.Errorf("wal: read header + crc length at offset %d (pos %d): %w", offset, pos, err)
 	}
-	length := binary.BigEndian.Uint32(lenBuf)
+	length := binary.BigEndian.Uint32(lenBuf[:4])
 
-	// 3. Read the CRC field (4 bytes), immediately after the length.
-	crcBuf := make([]byte, crcSize)
-	if _, err := r.file.ReadAt(crcBuf, pos+lengthSize); err != nil {
-		return nil, fmt.Errorf("wal: read crc at offset %d (pos %d): %w", offset, pos, err)
-	}
-	storedCRC := binary.BigEndian.Uint32(crcBuf)
+	storedCRC := binary.BigEndian.Uint32(lenBuf[4:])
 
 	// 4. Read exactly <length> payload bytes after the length+crc header.
 	payload := make([]byte, length)
