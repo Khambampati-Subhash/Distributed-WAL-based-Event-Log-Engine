@@ -47,7 +47,7 @@ func main() {
 	// ---- CONSUMER (first run): read two, commit, then "crash" ----------
 	fmt.Println("\n-- consumer reads two events, commits, then crashes --")
 	reader := segment.NewReader(producer)
-	offsetWriter := offset.NewOffsetWriter(offsetPath)
+	offsetWriter := offset.NewOffsetWriter(offsetPath, 20)
 
 	var lastRead uint64
 	for i := 0; i < 2; i++ {

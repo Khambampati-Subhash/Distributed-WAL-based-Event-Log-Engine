@@ -19,12 +19,23 @@ import (
 // it, then atomically rename it over the real file — rename is atomic on POSIX,
 // so a reader always sees either the old offset or the new one, never garbage.
 type OffsetWriter struct {
-	path string
-	mu   sync.Mutex
+	path           string
+	mu             sync.Mutex
+	nthOffset      uint32
+	previousOffset uint64
 }
 
-func NewOffsetWriter(path string) *OffsetWriter {
-	return &OffsetWriter{path: path}
+func NewOffsetWriter(path string, nthOffset uint32) *OffsetWriter {
+	return &OffsetWriter{path: path, nthOffset: nthOffset}
+}
+
+// instead of storing each offset in file everytime we can batch it
+func (w *OffsetWriter) BatchWrite(offset uint64) error {
+	if offset-w.previousOffset == uint64(w.nthOffset) {
+		w.previousOffset = offset
+		return w.Write(offset)
+	}
+	return nil
 }
 
 // Write durably persists offset as the consumer's committed position.

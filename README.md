@@ -486,7 +486,7 @@ data, off, err := r.Next()                    // -> "hello", 0, nil
 //                                               io.EOF when caught up
 
 // Crash recovery
-ow := offset.NewOffsetWriter("consumer-A.offset")
+ow := offset.NewOffsetWriter("consumer-A.offset", 20)
 ow.Write(off + 1)                             // commit progress
 resume, _ := offset.NewOffsetReader("consumer-A.offset").Read()
 r.Seek(resume)                                // resume after restart
@@ -535,3 +535,20 @@ internal/
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
 ```
+
+
+
+- Will start phase-6 where i will store every nth offset instead of every offset which may lose duarbility we need to think of ways to make it idempotent
+- If consumer as offset 100 we store at every 10th offset now offset is 106 it is taking and processing suddenly consumer failed so if offset file it is still 100 not 106 as we are batching and storing it which is a big problem as consumer already processes 6 events
+
+- our simple project now makes consumer store the offset not the system or our wal
+
+
+We can do one thing where wal can also store the offsets for all consumers in different files but still it will be something same as what we are doing right??
+Or consumer should be idempotent but if customer don't wants to process same event again then??
+Or instead of storing our wal cluster or engine tracks the offsets of this consumers in-memory when consumer is up it reads from file and also from in-memory which has greater that will be pick and also it updates the offset file also.
+
+
+many edge cases here:
+
+1. What if consumer + wal engine breaks in-memeoyr goes away

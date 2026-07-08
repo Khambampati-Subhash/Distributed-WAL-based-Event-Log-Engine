@@ -147,7 +147,7 @@ func runConsumer(
 	defer reader.Close()
 
 	// Resume from last committed offset (0 for a fresh consumer).
-	offsetWriter := offset.NewOffsetWriter(offsetPath)
+	offsetWriter := offset.NewOffsetWriter(offsetPath, 20)
 	resume, err := offset.NewOffsetReader(offsetPath).Read()
 	if err != nil {
 		log.Printf("consumer %s: %v", spec.name, err)
