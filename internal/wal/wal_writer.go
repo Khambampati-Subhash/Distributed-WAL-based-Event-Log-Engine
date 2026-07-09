@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -38,6 +39,7 @@ const (
 	crcSize          = 4
 	recordHeaderSize = lengthSize + crcSize
 	maxRecordSize    = 64 * 1024 * 1024 // 64MB sanity cap
+	nthIndex         = 10
 )
 
 // CorruptionError indicates detected bit-rot or corruption in the log.
@@ -53,11 +55,13 @@ func (e *CorruptionError) Error() string {
 }
 
 type WALWriter struct {
-	Mu    sync.Mutex   // serializes producers: one append at a time
-	File  *os.File     // the open append-only file (opened once, held here)
-	Index []int64      // Index[offset] = byte position where that record starts
-	table *crc32.Table // CRC32C (Castagnoli) polynomial, reused for all computations
-	size  int64        // current file size in bytes (tracked in-memory, no stat per write)
+	Mu        sync.Mutex // serializes producers: one append at a time
+	WalFile   *os.File   // the open append-only file (opened once, held here)
+	IndexFile *os.File
+	Index     []int64      // Index[offset] = byte position where that record starts
+	table     *crc32.Table // CRC32C (Castagnoli) polynomial, reused for all computations
+	size      int64        // current file size in bytes (tracked in-memory, no stat per write)
+	n         uint32
 }
 
 type WALWriterInterface interface {
@@ -83,6 +87,17 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 		return nil, fmt.Errorf("wal: open %q: %w", filename, err)
 	}
 
+	fileNameSplit := strings.Split(filename, ".")
+	indexFileName := strings.Join([]string{fileNameSplit[0], "index"}, ".")
+
+	_, statErr = os.Stat(indexFileName)
+	isNew = os.IsNotExist(statErr)
+
+	indexfile, err := os.OpenFile(indexFileName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("wal: open for index file %q: %w", indexFileName, err)
+	}
+
 	// fsync the parent directory so the newly-created log file's directory
 	// entry is durable. fsyncing the file persists its data + inode but NOT
 	// the directory that names it; without this a crash right after creation
@@ -95,8 +110,9 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 	}
 
 	w := &WALWriter{
-		File:  file,
-		table: crc32.MakeTable(crc32.Castagnoli),
+		WalFile:   file,
+		IndexFile: indexfile,
+		table:     crc32.MakeTable(crc32.Castagnoli),
 	}
 	if err := w.rebuildIndex(); err != nil {
 		file.Close()
@@ -126,6 +142,31 @@ func fsyncDir(dir string) error {
 	return d.Sync() // fsync the directory fd
 }
 
+func (w *WALWriter) IndexWriter(index, position uint64) error {
+	if w.n == nthIndex {
+		w.n = 0
+		var indexValue [8]byte
+		binary.BigEndian.PutUint64(indexValue[:], index)
+		var bytePositionValue [8]byte
+		binary.BigEndian.PutUint64(bytePositionValue[:], position)
+		var final []byte
+		final = append(final, indexValue[:]...)
+		final = append(final, bytePositionValue[:]...)
+
+		if _, err := w.IndexFile.Write(final); err != nil {
+			return fmt.Errorf("wal: write index + byte position: %w", err)
+		}
+
+		// fsync — data is only durable after this returns.
+		if err := w.IndexFile.Sync(); err != nil {
+			return fmt.Errorf("wal: fsync index+byte position: %w", err)
+		}
+
+	}
+	w.n++
+	return nil
+}
+
 // Write appends one opaque record and returns the offset it was stored at.
 func (w *WALWriter) Write(data []byte) (uint64, error) {
 	w.Mu.Lock()
@@ -138,7 +179,7 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 	}
 
 	// Current end of file = the byte position where this record will start.
-	pos, err := w.File.Seek(0, io.SeekEnd)
+	pos, err := w.WalFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, fmt.Errorf("wal: seek end: %w", err)
 	}
@@ -161,16 +202,21 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 	totalBytes = append(totalBytes, data[:]...)
 
 	// Write: [ len:4 ][ crc:4 ][ payload:N ]
-	if _, err := w.File.Write(totalBytes); err != nil {
+	if _, err := w.WalFile.Write(totalBytes); err != nil {
 		return 0, fmt.Errorf("wal: write header + crc + total payload: %w", err)
 	}
 
 	// fsync — data is only durable after this returns.
-	if err := w.File.Sync(); err != nil {
+	if err := w.WalFile.Sync(); err != nil {
 		return 0, fmt.Errorf("wal: fsync: %w", err)
 	}
 
 	offset := uint64(len(w.Index))
+
+	err = w.IndexWriter(offset, uint64(pos))
+	if err != nil {
+		return 0, err
+	}
 	w.Index = append(w.Index, pos)
 	w.size += recordHeaderSize + int64(len(data)) // track bytes written
 	return offset, nil
@@ -208,7 +254,7 @@ func (w *WALWriter) NextOffset() uint64 {
 func (w *WALWriter) Close() error {
 	w.Mu.Lock()
 	defer w.Mu.Unlock()
-	return w.File.Close()
+	return w.WalFile.Close()
 }
 
 // rebuildIndex scans the file once on startup and reconstructs Index.
@@ -222,7 +268,7 @@ func (w *WALWriter) Close() error {
 // Bit-rot is unexpected and requires operator intervention (investigate disk,
 // consider if more files are corrupt, etc). Never silently skip corrupt records.
 func (w *WALWriter) rebuildIndex() error {
-	if _, err := w.File.Seek(0, io.SeekStart); err != nil {
+	if _, err := w.WalFile.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek start: %w", err)
 	}
 
@@ -232,7 +278,7 @@ func (w *WALWriter) rebuildIndex() error {
 
 	for {
 		// Read the length field (4 bytes).
-		_, err := io.ReadFull(w.File, lenBuf)
+		_, err := io.ReadFull(w.WalFile, lenBuf)
 		if err == io.EOF {
 			break // clean end
 		}
@@ -255,7 +301,7 @@ func (w *WALWriter) rebuildIndex() error {
 		}
 
 		// Read the CRC field (4 bytes).
-		_, err = io.ReadFull(w.File, crcBuf)
+		_, err = io.ReadFull(w.WalFile, crcBuf)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return w.truncateTorn(pos) // partial record — torn tail
 		}
@@ -266,7 +312,7 @@ func (w *WALWriter) rebuildIndex() error {
 
 		// Read the payload.
 		payload := make([]byte, length)
-		_, err = io.ReadFull(w.File, payload)
+		_, err = io.ReadFull(w.WalFile, payload)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return w.truncateTorn(pos) // partial payload — torn tail
 		}
@@ -291,16 +337,16 @@ func (w *WALWriter) rebuildIndex() error {
 		pos += recordHeaderSize + length
 	}
 
-	_, err := w.File.Seek(0, io.SeekEnd)
+	_, err := w.WalFile.Seek(0, io.SeekEnd)
 	return err
 }
 
 // truncateTorn cuts off a half-written record left by a crash, so the log
 // only ever contains whole, durable records.
 func (w *WALWriter) truncateTorn(validEnd int64) error {
-	if err := w.File.Truncate(validEnd); err != nil {
+	if err := w.WalFile.Truncate(validEnd); err != nil {
 		return fmt.Errorf("wal: truncate torn record at %d: %w", validEnd, err)
 	}
-	_, err := w.File.Seek(0, io.SeekEnd)
+	_, err := w.WalFile.Seek(0, io.SeekEnd)
 	return err
 }
