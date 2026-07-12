@@ -275,6 +275,7 @@ func (w *WALWriter) rebuildIndex() error {
 	lenBuf := make([]byte, lengthSize)
 	crcBuf := make([]byte, crcSize)
 	var pos int64
+	var nn uint32
 
 	for {
 		// Read the length field (4 bytes).
@@ -333,8 +334,12 @@ func (w *WALWriter) rebuildIndex() error {
 			}
 		}
 
-		w.Index = append(w.Index, pos)
+		if nn == w.n {
+			w.Index = append(w.Index, pos)
+			nn = 0
+		}
 		pos += recordHeaderSize + length
+		nn++
 	}
 
 	_, err := w.WalFile.Seek(0, io.SeekEnd)
