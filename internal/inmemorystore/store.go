@@ -11,12 +11,11 @@ import (
 type InMemoryStore struct {
 	Index     map[uint64]int64
 	IndexFile *os.File
+	n         uint32
+	nthIndex  uint32
 }
 
-func NewInMemoryStore(indexFileName string) (*InMemoryStore, error) {
-	// Did the file already exist? If we're about to create it, the new
-	// directory entry must itself be fsynced (see below) or a crash could
-	// lose the file's name even though its data was synced.
+func NewInMemoryStore(indexFileName string, nthIndex uint32) (*InMemoryStore, error) {
 	_, statErr := os.Stat(indexFileName)
 	isNew := os.IsNotExist(statErr)
 	indexfile, err := os.OpenFile(indexFileName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
@@ -24,70 +23,92 @@ func NewInMemoryStore(indexFileName string) (*InMemoryStore, error) {
 		return nil, fmt.Errorf("wal: open for index file %q: %w", indexFileName, err)
 	}
 
-	// fsync the parent directory so the newly-created log file's directory
-	// entry is durable. fsyncing the file persists its data + inode but NOT
-	// the directory that names it; without this a crash right after creation
-	// could leave the file nameless (effectively gone).
 	if isNew {
 		if err := fsyncDir(filepath.Dir(indexFileName)); err != nil {
 			indexfile.Close()
 			return nil, fmt.Errorf("indexFile: fsync dir for %q: %w", indexFileName, err)
 		}
 	}
-	inMemoryStore := &InMemoryStore{Index: make(map[uint64]int64), IndexFile: indexfile}
-	if err := inMemoryStore.rebuildIndex(); err != nil {
+	store := &InMemoryStore{
+		Index:     make(map[uint64]int64),
+		IndexFile: indexfile,
+		nthIndex:  nthIndex,
+	}
+	if err := store.rebuildIndex(); err != nil {
 		indexfile.Close()
 		return nil, err
 	}
 
-	return inMemoryStore, nil
+	return store, nil
 }
 
-// fsyncDir flushes a directory's own metadata to stable storage. This is what
-// makes a create/rename of a file *inside* that directory durable: fsyncing a
-// file does not persist the directory entry that names it.
 func fsyncDir(dir string) error {
-	d, err := os.Open(dir) // open the directory read-only
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	return d.Sync() // fsync the directory fd
+	return d.Sync()
 }
 
-func (inMemoryStore *InMemoryStore) Get(offset uint64) int64 {
-	return 0
+func (s *InMemoryStore) Get(offset uint64) (int64, bool) {
+	pos, ok := s.Index[offset]
+	return pos, ok
 }
 
-func (inMemoryStore *InMemoryStore) Store(value int64) error {
+func (s *InMemoryStore) Put(offset uint64, position int64) {
+	s.Index[offset] = position
+}
+
+func (s *InMemoryStore) Len() int {
+	return len(s.Index)
+}
+
+func (s *InMemoryStore) WriteIndex(offset, position uint64) error {
+	if s.n == s.nthIndex {
+		s.n = 0
+		var buf [16]byte
+		binary.BigEndian.PutUint64(buf[0:8], offset)
+		binary.BigEndian.PutUint64(buf[8:16], position)
+
+		if _, err := s.IndexFile.Write(buf[:]); err != nil {
+			return fmt.Errorf("wal: write index + byte position: %w", err)
+		}
+		if err := s.IndexFile.Sync(); err != nil {
+			return fmt.Errorf("wal: fsync index+byte position: %w", err)
+		}
+	}
+	s.n++
 	return nil
 }
 
-func (inMemoryStore *InMemoryStore) rebuildIndex() error {
-	if _, err := inMemoryStore.IndexFile.Seek(0, io.SeekStart); err != nil {
+func (s *InMemoryStore) Close() error {
+	if s.IndexFile != nil {
+		return s.IndexFile.Close()
+	}
+	return nil
+}
+
+func (s *InMemoryStore) rebuildIndex() error {
+	if _, err := s.IndexFile.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek start: %w", err)
 	}
 
-	data := make([]byte, 8)
-	var pos int64
+	buf := make([]byte, 16)
 
 	for {
-		// Read the length field (4 bytes).
-		_, err := io.ReadFull(inMemoryStore.IndexFile, data)
+		_, err := io.ReadFull(s.IndexFile, buf)
 		if err == io.EOF {
-			break // clean end
+			break
 		}
 		if err != nil {
-			return fmt.Errorf("index File : read length at %d: %w", pos, err)
+			return fmt.Errorf("index file: read entry: %w", err)
 		}
 
-		storedOffsetValue := binary.BigEndian.Uint32(data[0:4])
-
-		storedBytePosition := binary.BigEndian.Uint32(data[4:8])
-
-		inMemoryStore.Index[uint64(storedOffsetValue)] = int64(storedBytePosition)
-
+		storedOffset := binary.BigEndian.Uint64(buf[0:8])
+		storedBytePosition := binary.BigEndian.Uint64(buf[8:16])
+		s.Index[storedOffset] = int64(storedBytePosition)
 	}
-	_, err := inMemoryStore.IndexFile.Seek(0, io.SeekEnd)
+	_, err := s.IndexFile.Seek(0, io.SeekEnd)
 	return err
 }
