@@ -1,57 +1,64 @@
-# TASK.md — Project journey & Phase 5 plan
+# TASK.md — Project journey & next steps
 
 A phase-by-phase record of **what** we built, **why** we chose it, the
 **limitations** each phase left behind, and **which later phase** fixes them.
 
 ---
 
-## Architecture flow (through Phase 4)
+## Architecture flow (current)
 
 ```
                          PRODUCERS                         CONSUMERS
                              │                                 │
                              │ Append([]byte)                  │ Next() / ReadAt(offset)
                              ▼                                 ▼
-                   ┌───────────────────┐             ┌───────────────────┐
-                   │  appendeventlog   │             │   readeventlog    │
-                   │ (producer wrapper)│             │ (consumer wrapper)│
-                   └─────────┬─────────┘             └─────────┬─────────┘
-                             │                                 │
-                             ▼                                 ▼
              ┌───────────────────────────────────────────────────────────┐
-             │                    segment.Manager                         │
-             │  • ordered []*Segment, last = ACTIVE                       │
-             │  • Append → active (roll by MaxSegmentBytes)               │
-             │  • ReadAt → binary-search segment by base offset           │
-             │  • Reader cursor → Next() crosses segment boundaries       │
-             │  • retention goroutine (ticker):                           │
+             │                    segment.Manager                       │
+             │  • ordered []*Segment, last = ACTIVE                     │
+             │  • Append → active (roll by MaxSegmentBytes)             │
+             │  • ReadAt → binary-search segment by base offset         │
+             │  • Reader cursor → Next() crosses segment boundaries     │
+             │  • retention goroutine (ticker):                         │
              │        decide+detach UNDER LOCK → act (Close+Remove) UNLOCKED
-             │        wait reader refcount before Close (no read cut off) │
-             │  • Metrics: deleted / bytesReclaimed / deleteErrors / runs │
+             │        wait reader refcount before Close (no read cut off)│
+             │  • Metrics: deleted / bytesReclaimed / deleteErrors / runs│
              └───────────────┬───────────────────────────────────────────┘
                              │ (each segment wraps one file)
                              ▼
              ┌───────────────────────────────────────────────────────────┐
-             │                     wal.WALWriter / WALReader              │
-             │  • append-only file, one mutex serializes writes           │
-             │  • record = [len:4][crc:4][payload:N]                      │
-             │  • fsync before ack (+ dir fsync on create)                │
-             │  • CRC32C verified on startup scan AND every read          │
-             │  • in-memory index[offset]→bytePos, rebuilt on startup     │
-             │  • torn-tail truncation on recovery                        │
+             │                  wal.WALWriter / WALReader                │
+             │  • append-only file, one mutex serializes writes         │
+             │  • record = [len:4][crc:4][payload:N]                    │
+             │  • single-buffer write + fsync before ack                │
+             │  • CRC32C verified on startup scan AND every read        │
+             │  • torn-tail truncation on recovery                      │
              └───────────────┬───────────────────────────────────────────┘
+                             │
                              ▼
-                    <dir>/00000000000000000000.log   (sealed)
-                          00000000000000001000.log   (sealed)
-                          00000000000000002000.log   (ACTIVE)
+             ┌───────────────────────────────────────────────────────────┐
+             │              inmemorystore.InMemoryStore                  │
+             │  • in-memory map[uint64]int64: offset → byte position    │
+             │  • sparse .index file: every Nth entry persisted         │
+             │  • rebuilt from WAL file on startup (full scan)          │
+             │  • Get/Put/Len/WriteIndex/Close                         │
+             └───────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+                    <dir>/00000000000000000000.log    (sealed)
+                          00000000000000000000.index  (sparse index)
+                          00000000000000001000.log    (sealed)
+                          00000000000000001000.index
+                          00000000000000002000.log    (ACTIVE)
+                          00000000000000002000.index
 
      consumeroffset ──► consumer-A.offset   (8-byte offset:
                         tmp + fsync + atomic rename + dir fsync)
+                        supports batched writes (every Nth commit)
 ```
 
 ---
 
-## Phase 1 — Embedded durable log  ✅ (tag: v1-embedded)
+## Phase 1 — Embedded durable log  (done)
 
 **Built:** an append-only file of length-prefixed records `[len][payload]`; an
 in-memory `index[offset]→bytePos` rebuilt by scanning on startup; `fsync` before
@@ -69,12 +76,12 @@ positional concurrent reads (`ReadAt`, one reader per goroutine).
 **Limitations left behind → fixed in:**
 - No corruption detection (a flipped bit in a whole record goes unnoticed) → **Phase 2**
 - One file grows forever; no deletion → **Phase 3 (segments)** + **Phase 4 (retention)**
-- Index holds every offset in RAM → **Phase 6 (sparse index)**
+- Index holds every offset in RAM → **Phase 5 (sparse index on disk)**
 - In-process only (no network) → **Phase 7**
 
-## Phase 2 — Integrity (CRC32C)  ✅ (tag: v2-checksums)
+## Phase 2 — Integrity (CRC32C)  (done)
 
-**Built:** a 4-byte CRC32C per record over `(length ‖ payload)`, format now
+**Built:** a 4-byte CRC32C per record over `(length || payload)`, format now
 `[len][crc][payload]`; verified on the startup scan **and** every read; a 3-way
 recovery decision tree (torn tail → truncate / corrupt length → stop / CRC
 mismatch → stop) with a 64 MB sanity cap; a typed `CorruptionError`.
@@ -91,9 +98,9 @@ mismatch → stop) with a 64 MB sanity cap; a typed `CorruptionError`.
 - Detection ≠ correction: we can *detect* bit-rot but not *repair* it (needs
   redundancy) → **Phase 7+ (replication)**
 - Recovery now reads+CRCs the whole log on startup (slower than Phase 1) →
-  **Phase 6 (persisted/sparse index reduces full rescans)**
+  **Phase 5/6 (sparse index reduces full rescans)**
 
-## Phase 3 — Segments  ✅ (tag: v3-segments)
+## Phase 3 — Segments  (done)
 
 **Built:** the log became a directory of segment files named by 20-digit
 zero-padded **base offset**; roll the active segment by `MaxSegmentBytes`;
@@ -111,9 +118,9 @@ per-segment index; global↔local offset translation; startup discovery
 **Limitations left behind → fixed in:**
 - Segments only *grow* — nothing deletes them → **Phase 4**
 - Keeps every segment file open (OS fd limit at scale) → **Phase 6 (lazy open)**
-- 3 write syscalls + `PositionOf` takes the write lock → **Phase 5**
+- `PositionOf` takes the write lock → **Phase 6**
 
-## Phase 4 — Retention  ✅ (tag: v4-retention)
+## Phase 4 — Retention  (done)
 
 **Built:** a background goroutine (ticker) that deletes segments whose
 last-append is older than `Retention`, never the active one; **decide-under-lock
@@ -134,55 +141,97 @@ fallback); metrics (deleted / bytesReclaimed / deleteErrors / runs).
   record lives until its whole segment ages out ("at least 7 days", not exactly).
 
 **Limitations left behind → fixed in:**
-- Every append still fsyncs individually; 3 write syscalls per record →
-  **Phase 5 (batching / single-write)**
-- `PositionOf`/index lookup takes the write mutex (readers contend) → **Phase 5**
-- Full index still in RAM (480 MB/day at 60M events) → **Phase 6 (sparse index)**
+- Every append still fsyncs individually → **Phase 6 (batching)**
+- `PositionOf`/index lookup takes the write mutex → **Phase 6**
+- Full index still in RAM → **Phase 5 (sparse index on disk, full in memory)**
 - Single node; no replication → **Phase 7/8**
+
+## Phase 5 — Index & Store  (in progress)
+
+**Built so far:**
+- **InMemoryStore** — extracted the in-memory `map[offset]→bytePos` from
+  `WALWriter` into its own package (`internal/inmemorystore`). Owns the sparse
+  `.index` file and provides `Get/Put/Len/WriteIndex/Close` methods with a
+  defined `InMemoryStoreInterface`.
+- **Sparse on-disk index** — `WriteIndex` persists every Nth offset-to-position
+  mapping (currently every 10th) to a `.index` file. Each entry is 16 bytes
+  (offset as uint64 + byte position as uint64). The in-memory map still holds
+  every record for fast lookups; the on-disk index enables faster future recovery.
+- **Single write per record** — `[len][crc][payload]` is assembled in one buffer
+  and written with a single `Write` syscall (was already done in earlier phases).
+- **Consumer offset batching** — `OffsetWriter.BatchWrite()` commits every Nth
+  offset instead of every one, reducing fsync frequency.
+
+**Bug fixes applied during this phase:**
+- WALReader CRC verification was including the stored CRC bytes in the checksum
+  computation, causing every read to fail with a CRC mismatch.
+- InMemoryStore `rebuildIndex` was reading 8 bytes (2x uint32) but `WriteIndex`
+  writes 16 bytes (2x uint64) — misaligned reads on recovery.
+- WALWriter `rebuildIndex` only indexed the first WAL record due to a counter
+  bug (`nn == w.n` with `w.n=0`), so recovery lost all but the first record.
+- `PositionOf` used `len(map)` to check bounds instead of the map comma-ok idiom,
+  which would return incorrect results for sparse maps.
+- Duplicate index file handles between WALWriter and InMemoryStore consolidated.
+
+**Still TODO in this phase:**
+- Use the sparse on-disk index to speed up recovery (seek to nearest indexed
+  position, scan forward) instead of always doing a full WAL scan.
+- Benchmark before/after to prove the wins.
 
 ---
 
-## Phase 5 — Optimizations (NEXT)
+## Phase 6 — Optimizations (next)
 
-**Goal:** make the write and read hot paths cheaper **without changing any
-guarantee** (durability, ordering, CRC, retention all stay intact). Every change
-must stay `-race` green and keep all existing tests passing.
+**Goal:** make the read hot path cheaper without changing any guarantee.
 
-**Scope (do, in order):**
-1. **Single write per record** — build `[len][crc][payload]` in one buffer and
-   issue **one** `Write` syscall instead of three. Fewer syscalls + removes the
-   tiny torn-write window between the three writes.
-2. **Decouple reader from writer / index behind an interface** — the reader
-   currently holds a concrete `*WALWriter` for `PositionOf`. Put the offset→pos
-   lookup behind a small interface so reads don't depend on the writer object.
-3. **Lock-free-ish index lookup** — `PositionOf` takes the *write* mutex today,
-   so readers contend with the writer and each other. Switch to `RWMutex` or an
-   atomic snapshot of the index so lookups don't serialize against appends.
-4. **(Measure first) single read** — combining the 3 reads into 1 is a *small*
-   win (after the first `ReadAt` the page is cached, so reads 2–3 hit RAM), and
-   it would need length-in-index (more memory). **Benchmark before doing it**; do
-   it only if the numbers justify it.
+**Scope:**
+1. **`RWMutex` or atomic index lookups** — `PositionOf` currently takes the write
+   mutex, so readers contend with the writer. Switch to `RWMutex` so lookups
+   don't serialize against appends.
+2. **Benchmark-driven read path** — measure single-read vs multi-read; combine
+   reads only if the numbers justify it.
+3. **Lazy segment fd management** — don't keep every segment file open; open on
+   demand and cache a bounded number of handles.
+4. **Fsync batching** — group multiple appends before fsyncing to amortize the
+   cost (trades latency for throughput).
 
-**Why Phase 5 is the right next priority (vs the other open limitations):**
-- The **survival** problems are already solved: integrity (P2) and unbounded
-  disk (P4) are done. What's left is **efficiency**, and among the efficiency
-  gaps this is the cheapest, lowest-risk, and touches code we *just* finished so
-  it's fresh.
-- **Sparse index (Phase 6)** is a bigger redesign of the index and is really an
-  *index-memory* fix; it builds naturally on top of a cleaned-up, decoupled index
-  — so decoupling the index here (step 2) is a prerequisite that de-risks Phase 6.
-- **Network (Phase 7)** should wrap an engine whose local hot paths are already
-  tight; optimizing after adding a network layer means re-profiling through the
-  wire. Do the local perf first.
-- Steps 1–3 are **guarantee-preserving and mechanical** — high confidence, low
-  blast radius — which is exactly what you want before the larger Phase 6/7
-  redesigns.
+---
 
-**Method:** add Go benchmarks (`testing.B`) for append and read FIRST, record the
-baseline, apply each optimization, and show the before/after. "Optimization"
-without a measured baseline is just guessing — we prove each win.
+## Open design questions
 
-**Explicitly deferred (unchanged):**
-- Sparse index → Phase 6 · Lazy fd open → Phase 6 · Network → Phase 7 ·
-  Partitions/consumer groups (the "per-account" idea) → Phase 8 ·
-  Replication (the fix for "detect but can't repair corruption") → Phase 7/8.
+### Consumer offset consistency with batched commits
+
+When consumer offset writes are batched (every Nth), a crash loses up to N-1
+offsets of progress. The consumer re-processes those events on restart. This is
+fine if consumers are **idempotent**, but problematic if they aren't.
+
+**Options considered:**
+1. **WAL engine tracks consumer offsets** — the engine stores offsets in its own
+   files per consumer. But this is essentially the same as what we do now, just
+   with a different owner.
+2. **Require consumer idempotency** — consumers must tolerate re-processing. This
+   is Kafka's model ("at-least-once" by default). But some consumers genuinely
+   can't re-process (e.g., sending emails, charging payments).
+3. **Dual tracking** — the engine tracks offsets in-memory while consumers also
+   persist to file. On restart, take the higher of the two. Edge case: both
+   engine and consumer crash simultaneously, in-memory state is lost, and we
+   fall back to the file offset (same as today).
+4. **Exactly-once via transactional outbox** — the consumer writes its side
+   effects and offset commit in the same transaction. This is the "real" solution
+   but requires the consumer to have a transactional store.
+
+**Current decision:** consumers own their offsets (option 2). The batching
+trade-off is explicit — the caller chooses the batch size and accepts the
+re-processing window. Exactly-once is a consumer-side concern, not an engine
+concern. This matches Kafka's philosophy.
+
+### Edge cases with offset tracking
+
+1. **Consumer + engine crash together** — in-memory offset gone, file offset may
+   be stale by up to N-1 records. Consumer re-processes the gap. Acceptable with
+   idempotent consumers.
+2. **Consumer crashes between processing and committing** — same as above, the
+   processed-but-uncommitted event gets re-delivered. This is inherent to
+   at-least-once delivery.
+3. **Multiple consumers sharing an offset file** — not supported. Each consumer
+   must have its own offset file. Consumer groups (Phase 8) will coordinate this.

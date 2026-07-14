@@ -5,10 +5,12 @@ that powers Kafka. Producers **append** opaque byte events; consumers **read**
 them back **by offset**. Data is persisted to disk as a durable
 **Write-Ahead Log (WAL)** and survives restarts and crashes.
 
-> **Status: Phase 1 — embedded library.** Runs in-process, no network. The goal
-> of this phase is a correct, durable, single-file log with crash recovery and
-> consumer offset tracking. Networking, segmentation, retention and snapshots
-> come in later phases (see [Roadmap](#roadmap)).
+> **Status: Phase 5 in progress — sparse index + InMemoryStore.**
+> Phases 1–4 are complete: durable append, CRC32C integrity, segmented files,
+> and time-based retention. Phase 5 adds a sparse on-disk index (every Nth
+> offset), an extracted `InMemoryStore` for index management, and consumer
+> offset batching. Networking and partitions come in later phases
+> (see [Roadmap](#roadmap)).
 
 ---
 
@@ -53,16 +55,21 @@ next `N` payload bytes and verify the CRC. `len` and `crc` are big-endian
 `uint32`. The engine never looks inside the payload — it stores and returns
 **opaque bytes**. See [Integrity (CRC32C)](#integrity-crc32c) for why and how.
 
-### The index lives in RAM, not on disk
+### Index: in-memory map + sparse on-disk index file
 
-The map of `offset → byte position` is kept **in memory** and **rebuilt by
-scanning the file once on startup**. We do *not* store positions in the file,
-because that would require seeking back to rewrite a header on every append —
-which would no longer be append-only.
+The full map of `offset → byte position` is kept **in memory** (in the
+`InMemoryStore`) and **rebuilt by scanning the WAL file on startup**. Every
+record gets an entry in the in-memory map for fast lookups.
+
+A **sparse on-disk index file** (`.index`) stores every Nth offset-to-position
+mapping (currently every 10th). This enables faster recovery for large logs —
+instead of scanning the entire WAL, a future optimization can seek to the nearest
+indexed position and scan forward from there.
 
 ```
-in memory:   Index = [0, 13, 26]     // Index[offset] = byte position
-on startup:  scan file front-to-back, rebuild Index, drop any torn tail record
+in memory:   Index = {0: 0, 1: 13, 2: 26, ...}   // every offset
+on disk:     .index = [(10, pos), (20, pos), ...]  // every 10th offset
+on startup:  scan WAL front-to-back, rebuild full index, drop any torn tail
 ```
 
 ---
@@ -78,6 +85,15 @@ A segment is *not* a new format — it's just a slice of the same record stream.
   00000000000000000000.log   offsets 0 .. 999      (sealed)
   00000000000000001000.log   offsets 1000 .. 1999  (sealed)
   00000000000000002000.log   offsets 2000 ..       (ACTIVE — appends land here)
+```
+
+Each segment also has a corresponding `.index` file for sparse offset storage:
+
+```
+<dir>/
+  00000000000000000000.index  sparse index for segment 0
+  00000000000000001000.index  sparse index for segment 1000
+  ...
 ```
 
 - **Filename = base offset** (the first offset in the file), zero-padded to 20
@@ -100,7 +116,7 @@ global offset  ──(find owning segment)──►  local slot = global − bas
 
 This indirection is what makes deleting old segments safe (see Retention below):
 offsets are no longer a single dense array from 0, they're keyed by each
-segment's base offset. The `SegmentManager` owns the ordered segments, routes
+segment's base offset. The `Manager` owns the ordered segments, routes
 `Append` to the active one, and routes each read to the segment that owns that
 offset. A consumer `Reader` walks the whole log with `Next()`, crossing segment
 boundaries transparently.
@@ -193,7 +209,8 @@ different access patterns:
 
 | What | File | Access pattern | How it's written |
 |------|------|----------------|------------------|
-| **Events** (the log) | `events.log` | append-only, never modified | append record + `fsync` |
+| **Events** (the log) | `*.log` | append-only, never modified | append record + `fsync` |
+| **Sparse index** | `*.index` | append-only, every Nth offset | append entry + `fsync` |
 | **Consumer offset** | `consumer-A.offset` | a single value, overwritten in place | tmp file + `fsync` + atomic rename + dir `fsync` |
 
 The reason they differ: events are *immutable and grow forever*, so appending is
@@ -212,16 +229,17 @@ returns once they're durable. The rule everywhere in this engine is:
 
 ### 1. Storing events (the WAL)
 
-Each append writes a length-prefixed record at the end of the file, fsyncs, and
-only then returns the offset to the producer:
+Each append writes the full record in a single buffer and issues one `Write`
+syscall, then fsyncs:
 
 ```
 Append(data):
    lock
-     write [len][payload] at end of file
-     fsync()                  ◄── only NOW is it durable
-     record position in Index
-     offset = len(Index)
+     build [len][crc][payload] into one buffer
+     write buffer at end of file   (single syscall)
+     fsync()                       ◄── only NOW is it durable
+     store offset→position in InMemoryStore
+     write sparse index entry (every Nth record)
    unlock
    return offset
 ```
@@ -251,6 +269,10 @@ This is the same pattern databases use to update config/manifest/checkpoint
 files (and how tools safely update `/etc/passwd`). On recovery, `OffsetReader`
 reads it back; a brand-new consumer that never committed reads "no file" as
 offset `0` (start from the beginning).
+
+Consumer offset writes can be **batched** — the `OffsetWriter` supports writing
+every Nth offset to reduce fsync frequency, trading off a bounded amount of
+re-processing on crash for significantly higher throughput.
 
 ### Atomicity ≠ durability
 
@@ -286,7 +308,7 @@ func fsyncDir(dir string) error {
 
 ### Durability summary
 
-| Failure | Events (`events.log`) | Offset (`consumer-A.offset`) |
+| Failure | Events (`*.log`) | Offset (`consumer-A.offset`) |
 |---------|----------------------|------------------------------|
 | Process exits cleanly | safe (page cache survives the process) | safe |
 | OS crash / power loss after ack | safe (fsynced data + fsynced dir on create) | safe (fsynced tmp + fsynced dir on rename) |
@@ -317,10 +339,10 @@ guarantee is precise:
 
 | Option | Verdict | Why |
 |--------|---------|-----|
-| **CRC32C (Castagnoli)** ✅ | **chosen** | Hardware-accelerated (one CPU instruction on modern x86/ARM → ~free); superior burst-error detection; **this is what Kafka, ext4, and iSCSI use.** |
-| CRC32 (IEEE / zlib) | rejected | Equally simple but no guaranteed HW acceleration and weaker error properties than Castagnoli. Only "more familiar." |
-| MD5 / SHA-256 | rejected | These are *cryptographic* hashes — built to resist a malicious forger, at 10–50× the CPU cost. We're defending against **random disk faults, not attackers.** At ~694 events/sec (the real target workload) a crypto hash per record adds needless latency. |
-| No checksum (Phase 1) | rejected | Can only catch a *torn tail* at EOF. A flipped bit in the *middle* of a complete record goes completely undetected. |
+| **CRC32C (Castagnoli)** | **chosen** | Hardware-accelerated (one CPU instruction on modern x86/ARM); superior burst-error detection; **this is what Kafka, ext4, and iSCSI use.** |
+| CRC32 (IEEE / zlib) | rejected | Equally simple but no guaranteed HW acceleration and weaker error properties than Castagnoli. |
+| MD5 / SHA-256 | rejected | *Cryptographic* hashes — built to resist a malicious forger, at 10–50x the CPU cost. We're defending against **random disk faults, not attackers.** |
+| No checksum | rejected | Can only catch a *torn tail* at EOF. A flipped bit in the middle of a complete record goes completely undetected. |
 
 The mental model: **CRC is a smoke detector, not a safe.** It's cheap, fast, and
 catches accidents. It is *not* trying to stop a determined attacker — that's a
@@ -328,7 +350,7 @@ different problem (signatures/MACs) we don't have here.
 
 ### What the CRC covers, and why
 
-The CRC is computed over **`length ‖ payload`**, not the payload alone:
+The CRC is computed over **`length || payload`**, not the payload alone:
 
 ```
 crc = CRC32C( [4-byte length] + [payload bytes] )
@@ -402,27 +424,33 @@ read in parallel without blocking the writer.
 
 ```
                      ┌─────────────────────────────────────┐
-   producer ─Append─►│           appendeventlog            │
-                     │      (producer-facing wrapper)      │
+   producer ─Append─►│         segment.Manager              │
+                     │  ordered segments, active, roll,     │
+                     │  route reads, retention loop         │
+                     └───────────────┬─────────────────────┘
+                                     │ (each segment wraps one file)
+                     ┌───────────────▼─────────────────────┐
+                     │       wal.WALWriter / WALReader      │
+                     │  append-only file, mutex, CRC32C     │
+                     │  fsync before ack, torn-tail recovery│
                      └───────────────┬─────────────────────┘
                                      │
                      ┌───────────────▼─────────────────────┐
-                     │              segment                │
-                     │  Manager: ordered segments, active, │
-                     │           roll by size, route reads │     <dir>/
-                     │  Reader:  cross-segment Next() cursor│   ...0000.log
-                     └───────────────┬─────────────────────┘   ...1000.log
-                                     │  (each segment wraps a) ...2000.log
-                     ┌───────────────▼─────────────────────┐◄────────────► (disk)
-                     │                wal                  │
-                     │  WALWriter: file + mutex + Index    │
-                     │  WALReader: own RO handle, ReadAt   │
-                     └───────────────▲─────────────────────┘
-                                     │
-                     ┌───────────────┴─────────────────────┐
-   consumer ─Next───►│            readeventlog             │
-                     │      (consumer-facing wrapper)      │
+                     │       inmemorystore.InMemoryStore     │
+                     │  in-memory map[offset]→bytePos       │
+                     │  sparse .index file (every Nth)      │
+                     │  rebuilt from WAL + index on startup  │
                      └─────────────────────────────────────┘
+                                     │
+                                     ▼
+                    <dir>/00000000000000000000.log    (sealed)
+                          00000000000000000000.index
+                          00000000000000001000.log    (sealed)
+                          00000000000000001000.index
+                          00000000000000002000.log    (ACTIVE)
+                          00000000000000002000.index
+
+   consumer ─Next───► segment.Reader (cross-segment cursor)
 
    consumer ─commit─► consumeroffset  ──►  consumer-A.offset  (disk)
                       (8-byte uint64: tmp + fsync + atomic rename + dir fsync)
@@ -433,28 +461,34 @@ read in parallel without blocking the writer.
 | Package | Responsibility |
 |---------|----------------|
 | `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), CRC32C, recovery. |
+| `internal/inmemorystore` | In-memory offset-to-position map + sparse on-disk `.index` file management. |
 | `internal/segment` | Splits the log into base-offset segment files; `Manager` routes append/read + rolls, `Reader` is a cross-segment cursor. |
-| `internal/appendeventlog` | Producer-facing API: `Append([]byte) -> offset` over the segment manager. |
-| `internal/readeventlog`   | Consumer-facing API: `Next() -> data, offset` / `ReadAt(offset)`. |
-| `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery. |
-| `cmd`, `cmd/concurrent`   | Demos wiring it all together. |
+| `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery (supports batched writes). |
+| `cmd` | Single-flow demo (durable + CRC + segments + consumer offset). |
+| `cmd/concurrent` | Multi-producer/consumer demo with live lag metrics. |
+| `cmd/retention` | Retention demo: age out segments + loud consumer reset. |
 
 ---
 
-## Run the demo
+## Run the demos
 
 ```bash
+# Basic flow: append, read, crash, recover from committed offset
 go run ./cmd
+
+# Concurrent producers/consumers with lag metrics (run with -race)
+go run -race ./cmd/concurrent
+
+# Retention: segments age out, stale consumer gets loud reset
+go run ./cmd/retention
 ```
 
-It appends five events (rolling them across multiple segment files), reads two
-as a consumer, commits its offset, simulates a **crash**, then restarts and
-**resumes from the committed offset** — across segment boundaries:
+Basic demo output:
 
 ```
   appended offset=0  event="user.signup"
   ...
-  (log spread across 3 segment files)
+  (log spread across 1 segment files)
 -- consumer reads two events, commits, then crashes --
   read offset=0  event="user.signup"
   read offset=1  event="order.created"
@@ -467,88 +501,89 @@ as a consumer, commits its offset, simulates a **crash**, then restarts and
   caught up — no more events
 ```
 
-A second demo, `go run ./cmd/concurrent`, runs many producers and consumers at
-once across segments, printing live consumer lag.
-
 ### Core API
 
 ```go
 // Producer — open (or reopen) a segmented log in a directory.
-p, _ := eventlog.NewEventLogAppend(segment.Config{
+m, _ := segment.Open(segment.Config{
     Dir:             "mylog",
     MaxSegmentBytes: 1 << 30, // roll to a new segment past 1 GiB
 })
-offset, _ := p.Append([]byte("hello"))       // -> 0
+offset, _ := m.Append([]byte("hello"))       // -> 0
 
 // Consumer — a cursor over the whole log, crossing segments transparently.
-r := readeventlog.NewReadEventLog(p.Manager())
-data, off, err := r.Next()                    // -> "hello", 0, nil
-//                                               io.EOF when caught up
+r := segment.NewReader(m)
+data, off, err := r.Next()                   // -> "hello", 0, nil
+//                                              io.EOF when caught up
 
-// Crash recovery
-ow := offset.NewOffsetWriter("consumer-A.offset", 20)
-ow.Write(off + 1)                             // commit progress
-resume, _ := offset.NewOffsetReader("consumer-A.offset").Read()
-r.Seek(resume)                                // resume after restart
+// Crash recovery — persist and resume consumer progress.
+ow := consumeroffset.NewOffsetWriter("consumer-A.offset", 20)
+ow.Write(off + 1)                            // commit progress
+resume, _ := consumeroffset.NewOffsetReader("consumer-A.offset").Read()
+r.Seek(resume)                               // resume after restart
 ```
+
+---
+
+## Tests
+
+```bash
+# Run all tests with race detector
+go test -race ./...
+
+# Run specific packages
+go test -race ./internal/wal/        # WAL unit + CRC + concurrency tests
+go test -race ./internal/segment/    # Segment roll + recovery + retention tests
+```
+
+Key test coverage:
+- **CRC detection**: manufactured bit-rot is caught on startup and at runtime
+- **Torn tail recovery**: crash mid-write → truncate, keep valid records
+- **Concurrent safety**: 8 producers + 8 readers under `-race`
+- **Segment rolling**: records spread across files, readable by global offset
+- **Recovery**: reopen directory, rebuild indexes, continue at correct offset
+- **Retention**: aged segments deleted, active never deleted, stale consumer gets loud error
+- **Retention + concurrency**: retention runs while producers append and consumers read
 
 ---
 
 ## Roadmap
 
 Each phase is intentionally scoped to **one** idea so it ships. Bigger ideas
-that get conflated with the current phase (retention, partitioning, perf) are
-deliberately pushed to their own phase.
+that get conflated with the current phase are deliberately pushed to their own
+phase.
 
 | Phase | Adds | Key concepts learned |
 |-------|------|----------------------|
-| **1 — Embedded log** ✅ | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
-| **2 — Integrity** ✅ | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
-| **3 — Segments** ✅ | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads. **Format unchanged.** | log segmentation, base offsets |
-| **4 — Retention** ✅ | Background deletion of aged segments (never the active one); decide-under-lock/act-outside-lock; reader refcount so no read is cut off; loud `OffsetOutOfRetentionError` reset; per-segment last-append time (mtime fallback); metrics | retention, background cleanup, lock-vs-I/O discipline |
-| 5 — Optimizations | Single-write per record (len+crc+payload); reader/index decoupled; atomic/`RWMutex` index lookup; (measure single-read) | I/O batching, lock-free reads |
-| 6 — Sparse index | Store every Nth offset → position (not every one); seek + scan-forward | bounded index memory (Kafka-style) |
+| **1 — Embedded log** | Durable append-only file, in-memory index, crash recovery, consumer offsets | WAL, fsync, append-only, offsets |
+| **2 — Integrity** | CRC32C per record, verified on read + startup; 3-way recovery (torn tail / corrupt length / bit-rot) | corruption detection, checksums |
+| **3 — Segments** | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads | log segmentation, base offsets |
+| **4 — Retention** | Background deletion of aged segments (never the active one); decide-under-lock/act-outside-lock; reader refcount; loud `OffsetOutOfRetentionError`; metrics | retention, background cleanup, lock discipline |
+| **5 — Index & Store** (in progress) | Sparse on-disk index (every Nth offset); `InMemoryStore` extraction; single-write-per-record; consumer offset batching | sparse indexing, separation of concerns |
+| 6 — Optimizations | `RWMutex` / atomic index lookups; benchmark-driven read path improvements; lazy segment fd management | lock-free reads, I/O optimization |
 | 7 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
-| 8 — Partitions & consumer groups | Many independent logs (e.g. per key/"account"), per-partition offsets, group coordination | horizontal scale, the rest of Kafka |
-
-> **Scope notes (things deliberately deferred to keep each phase to one idea):**
-> - **"Per-account folder" → Phase 8 (partitioning), NOT segmenting.** Segmenting = one log split into files. Partitioning = many independent logs keyed by something. The engine has no notion of an "account" yet.
-> - **Date-wise filenames → rejected.** We name segments by *base offset* (needed for offset lookup) and roll by *size*; date names conflict with both.
-> - **Single-read / atomic index → Phase 5.** Deferred because segments rewrite the very index code those optimizations target — optimizing it first would be polishing code we're about to replace.
+| 8 — Partitions & consumer groups | Many independent logs (e.g. per key), per-partition offsets, group coordination | horizontal scale |
 
 ---
 
 ## Project layout
 
 ```
-cmd/main.go                                  # single-flow demo (durable + CRC + segments)
-cmd/concurrent/main.go                       # many producers/consumers + lag metrics
-cmd/retention/main.go                        # retention: age out segments + loud reset
+cmd/main.go                                  # single-flow demo
+cmd/concurrent/main.go                       # multi-producer/consumer + lag metrics
+cmd/retention/main.go                        # retention demo + loud reset
 internal/
   wal/wal_writer.go                          # per-file durable append + CRC + recovery
   wal/wal_reader.go                          # per-file positional reads by offset
+  wal/wal_test.go                            # WAL unit + concurrency tests
+  wal/crc_test.go                            # CRC detection + torn tail tests
+  inmemorystore/store.go                     # in-memory index map + sparse .index file
+  inmemorystore/interface.go                 # InMemoryStoreInterface definition
   segment/segment.go                         # one segment = WALWriter + base offset + refcount
   segment/manager.go                         # ordered segments, roll, route, retention loop
   segment/reader.go                          # cross-segment Next() cursor + reset
-  appendeventlog/append_event_log.go         # producer API (over segment manager)
-  readeventlog/read_event_log.go             # consumer API (over segment reader)
-  consumeroffset/consumer_offset_writer.go   # commit offset (atomic)
+  segment/manager_test.go                    # segment roll + recovery tests
+  segment/retention_test.go                  # retention + concurrent safety tests
+  consumeroffset/consumer_offset_writer.go   # commit offset (atomic replace + batching)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
 ```
-
-
-
-- Will start phase-6 where i will store every nth offset instead of every offset which may lose duarbility we need to think of ways to make it idempotent
-- If consumer as offset 100 we store at every 10th offset now offset is 106 it is taking and processing suddenly consumer failed so if offset file it is still 100 not 106 as we are batching and storing it which is a big problem as consumer already processes 6 events
-
-- our simple project now makes consumer store the offset not the system or our wal
-
-
-We can do one thing where wal can also store the offsets for all consumers in different files but still it will be something same as what we are doing right??
-Or consumer should be idempotent but if customer don't wants to process same event again then??
-Or instead of storing our wal cluster or engine tracks the offsets of this consumers in-memory when consumer is up it reads from file and also from in-memory which has greater that will be pick and also it updates the offset file also.
-
-
-many edge cases here:
-
-1. What if consumer + wal engine breaks in-memeoyr goes away
