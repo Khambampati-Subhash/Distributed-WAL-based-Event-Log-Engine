@@ -7,18 +7,29 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 )
 
-// TestWriteReadRecover covers the single-threaded happy path plus recovery:
-// append two records, read them back, hit EOF past the end, then reopen and
-// confirm the index is rebuilt from disk.
-func TestWriteReadRecover(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "events.log")
-
-	w, err := NewWalWriter(path)
+func newTestWriter(t *testing.T, path string) (*WALWriter, *inmemorystore.InMemoryStore) {
+	t.Helper()
+	idxPath := path + ".index"
+	store, err := inmemorystore.NewInMemoryStore(idxPath, NthIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
+	w, err := NewWalWriter(path, store)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	return w, store
+}
+
+func TestWriteReadRecover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.log")
+
+	w, store := newTestWriter(t, path)
 	o0, err := w.Write([]byte("hello"))
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +42,7 @@ func TestWriteReadRecover(t *testing.T) {
 		t.Fatalf("offsets should be 0,1 got %d,%d", o0, o1)
 	}
 
-	r, err := NewWALReader(path, w)
+	r, err := NewWALReader(path, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,27 +62,16 @@ func TestWriteReadRecover(t *testing.T) {
 	}
 	r.Close()
 	w.Close()
+	store.Close()
 
-	// Reopen: index must be rebuilt by scanning the file on disk.
-	w2, err := NewWalWriter(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w2, store2 := newTestWriter(t, path)
 	defer w2.Close()
+	defer store2.Close()
 	if got := w2.NextOffset(); got != 2 {
 		t.Fatalf("recovery should rebuild 2 records, got %d", got)
 	}
 }
 
-// TestConcurrentProducersAndConsumers is the safety guard for the concurrency
-// model. Run it with the race detector:
-//
-//	go test -race ./internal/wal/
-//
-// Many producers append at once; many readers read independently at the same
-// time. It asserts (a) every appended record gets a unique offset in [0, total)
-// and (b) every record is readable with intact bytes. The race detector proves
-// there are no unsynchronized memory accesses.
 func TestConcurrentProducersAndConsumers(t *testing.T) {
 	const (
 		producers         = 8
@@ -81,17 +81,13 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 	total := producers * eventsPerProducer
 
 	path := filepath.Join(t.TempDir(), "events.log")
-	w, err := NewWalWriter(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w, store := newTestWriter(t, path)
 	defer w.Close()
+	defer store.Close()
 
-	// --- concurrent producers ---
-	// Collect every offset returned so we can prove they're unique and dense.
 	offsets := make([]uint64, total)
 	var idx int64
-	var mu sync.Mutex // guards idx -> position in offsets slice
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for p := 0; p < producers; p++ {
 		wg.Add(1)
@@ -112,15 +108,12 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 		}(p)
 	}
 
-	// --- concurrent readers, running WHILE producers append ---
-	// Each reader gets its OWN WALReader (own handle, own cursor) and walks
-	// the log from 0 until it catches up to the current head.
 	var readWg sync.WaitGroup
 	for rdr := 0; rdr < readers; rdr++ {
 		readWg.Add(1)
 		go func(rid int) {
 			defer readWg.Done()
-			reader, err := NewWALReader(path, w)
+			reader, err := NewWALReader(path, store)
 			if err != nil {
 				t.Errorf("reader %d open: %v", rid, err)
 				return
@@ -130,7 +123,7 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 			for seen < uint64(total) {
 				data, off, err := reader.Read()
 				if err == io.EOF {
-					continue // caught up to head; more may arrive
+					continue
 				}
 				if err != nil {
 					t.Errorf("reader %d: %v", rid, err)
@@ -145,10 +138,9 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 		}(rdr)
 	}
 
-	wg.Wait()     // all producers done
-	readWg.Wait() // all readers caught up
+	wg.Wait()
+	readWg.Wait()
 
-	// --- correctness: offsets are exactly the set {0,1,...,total-1} ---
 	if w.NextOffset() != uint64(total) {
 		t.Fatalf("expected %d records, got %d", total, w.NextOffset())
 	}
@@ -163,8 +155,7 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 		seen[off] = true
 	}
 
-	// --- every record is readable with non-empty bytes ---
-	r, err := NewWALReader(path, w)
+	r, err := NewWALReader(path, store)
 	if err != nil {
 		t.Fatal(err)
 	}

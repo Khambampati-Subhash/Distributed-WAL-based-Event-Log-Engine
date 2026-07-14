@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
@@ -19,11 +18,11 @@ import (
 //	[ crc    : 4-byte big-endian CRC32C of (length || payload) ]
 //	[ payload : <length> bytes ]
 const (
-	lengthSize       = 4
-	crcSize          = 4
-	recordHeaderSize = lengthSize + crcSize
-	maxRecordSize    = 64 * 1024 * 1024 // 64MB sanity cap
-	nthIndex         = 10
+	LengthSize       = 4
+	CrcSize          = 4
+	RecordHeaderSize = LengthSize + CrcSize
+	MaxRecordSize    = 64 * 1024 * 1024 // 64MB sanity cap
+	NthIndex         = 10
 )
 
 // CorruptionError indicates detected bit-rot or corruption in the log.
@@ -31,7 +30,7 @@ type CorruptionError struct {
 	Offset   int64  // byte position in file
 	Expected uint32 // expected CRC
 	Got      uint32 // actual CRC computed from bytes
-	Reason   string // "length out of bounds", "crc mismatch", etc.
+	Reason   string
 }
 
 func (e *CorruptionError) Error() string {
@@ -39,24 +38,18 @@ func (e *CorruptionError) Error() string {
 }
 
 type WALWriter struct {
-	Mu            sync.Mutex // serializes producers: one append at a time
-	WalFile       *os.File   // the open append-only file (opened once, held here)
-	table         *crc32.Table
-	size          int64
-	inMemoryStore *inmemorystore.InMemoryStore
-}
-
-type WALWriterInterface interface {
-	Write(data []byte) (uint64, error)
-	Size() int64
-	PositionOf(offset uint64) (int64, bool)
-	NextOffset() uint64
-	Close() error
+	mu    sync.Mutex
+	file  *os.File
+	table *crc32.Table
+	size  int64
+	store inmemorystore.InMemoryStoreInterface
 }
 
 // NewWalWriter opens (or creates) the log file and rebuilds the in-memory
 // index from whatever is already on disk, so the log survives a restart.
-func NewWalWriter(filename string) (*WALWriter, error) {
+// The caller provides the InMemoryStore that will hold offset-to-position
+// mappings; this decouples the writer from index file management.
+func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface) (*WALWriter, error) {
 	_, statErr := os.Stat(filename)
 	isNew := os.IsNotExist(statErr)
 
@@ -72,37 +65,25 @@ func NewWalWriter(filename string) (*WALWriter, error) {
 		}
 	}
 
-	fileNameSplit := strings.Split(filename, ".")
-	indexFileName := strings.Join([]string{fileNameSplit[0], "index"}, ".")
-
-	store, err := inmemorystore.NewInMemoryStore(indexFileName, nthIndex)
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-
 	w := &WALWriter{
-		WalFile:       file,
-		table:         crc32.MakeTable(crc32.Castagnoli),
-		inMemoryStore: store,
+		file:  file,
+		table: crc32.MakeTable(crc32.Castagnoli),
+		store: store,
 	}
 	if err := w.rebuildIndex(); err != nil {
 		file.Close()
-		store.Close()
 		return nil, err
 	}
 
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		file.Close()
-		store.Close()
 		return nil, fmt.Errorf("wal: size after recovery: %w", err)
 	}
 	w.size = size
 	return w, nil
 }
 
-// fsyncDir flushes a directory's own metadata to stable storage.
 func fsyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -114,92 +95,85 @@ func fsyncDir(dir string) error {
 
 // Write appends one opaque record and returns the offset it was stored at.
 func (w *WALWriter) Write(data []byte) (uint64, error) {
-	w.Mu.Lock()
-	defer w.Mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	if len(data) > maxRecordSize {
-		return 0, fmt.Errorf("wal: payload too large (%d > %d)", len(data), maxRecordSize)
+	if len(data) > MaxRecordSize {
+		return 0, fmt.Errorf("wal: payload too large (%d > %d)", len(data), MaxRecordSize)
 	}
 
-	pos, err := w.WalFile.Seek(0, io.SeekEnd)
+	pos, err := w.file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, fmt.Errorf("wal: seek end: %w", err)
 	}
 
-	var lenBuf [lengthSize]byte
+	var lenBuf [LengthSize]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 
 	crcChecksum := crc32.Checksum(lenBuf[:], w.table)
 	crcChecksum = crc32.Update(crcChecksum, w.table, data)
 
-	var crcBuf [crcSize]byte
+	var crcBuf [CrcSize]byte
 	binary.BigEndian.PutUint32(crcBuf[:], crcChecksum)
 
-	var totalBytes []byte
-	totalBytes = append(totalBytes, lenBuf[:]...)
-	totalBytes = append(totalBytes, crcBuf[:]...)
-	totalBytes = append(totalBytes, data[:]...)
+	buf := make([]byte, 0, RecordHeaderSize+len(data))
+	buf = append(buf, lenBuf[:]...)
+	buf = append(buf, crcBuf[:]...)
+	buf = append(buf, data...)
 
-	if _, err := w.WalFile.Write(totalBytes); err != nil {
-		return 0, fmt.Errorf("wal: write header + crc + total payload: %w", err)
+	if _, err := w.file.Write(buf); err != nil {
+		return 0, fmt.Errorf("wal: write record: %w", err)
 	}
 
-	if err := w.WalFile.Sync(); err != nil {
+	if err := w.file.Sync(); err != nil {
 		return 0, fmt.Errorf("wal: fsync: %w", err)
 	}
 
-	offset := uint64(w.inMemoryStore.Len())
+	offset := uint64(w.store.Len())
 
-	err = w.inMemoryStore.WriteIndex(offset, uint64(pos))
-	if err != nil {
+	if err := w.store.WriteIndex(offset, uint64(pos)); err != nil {
 		return 0, err
 	}
-	w.inMemoryStore.Put(offset, pos)
-	w.size += recordHeaderSize + int64(len(data))
+	w.store.Put(offset, pos)
+	w.size += RecordHeaderSize + int64(len(data))
 	return offset, nil
 }
 
 // Size returns the current size of the segment file in bytes.
 func (w *WALWriter) Size() int64 {
-	w.Mu.Lock()
-	defer w.Mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.size
-}
-
-// PositionOf returns the byte position where the record at offset begins.
-func (w *WALWriter) PositionOf(offset uint64) (int64, bool) {
-	w.Mu.Lock()
-	defer w.Mu.Unlock()
-	return w.inMemoryStore.Get(offset)
 }
 
 // NextOffset returns the offset the next Write will be assigned.
 func (w *WALWriter) NextOffset() uint64 {
-	w.Mu.Lock()
-	defer w.Mu.Unlock()
-	return uint64(w.inMemoryStore.Len())
+	return uint64(w.store.Len())
 }
 
-// Close closes the underlying file and index.
+// Close closes the underlying WAL file. The caller is responsible for
+// closing the InMemoryStore separately.
 func (w *WALWriter) Close() error {
-	w.Mu.Lock()
-	defer w.Mu.Unlock()
-	w.inMemoryStore.Close()
-	return w.WalFile.Close()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Close()
 }
 
-// rebuildIndex scans the WAL file on startup and reconstructs the in-memory index.
+// rebuildIndex scans the WAL file on startup and reconstructs the in-memory
+// index. Also restores the sparse index counter so on-disk index entries
+// continue at the correct interval after restart.
 func (w *WALWriter) rebuildIndex() error {
-	if _, err := w.WalFile.Seek(0, io.SeekStart); err != nil {
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("wal: seek start: %w", err)
 	}
 
-	lenBuf := make([]byte, lengthSize)
-	crcBuf := make([]byte, crcSize)
+	lenBuf := make([]byte, LengthSize)
+	crcBuf := make([]byte, CrcSize)
 	var pos int64
+	var recordCount uint32
 
 	for {
-		_, err := io.ReadFull(w.WalFile, lenBuf)
+		_, err := io.ReadFull(w.file, lenBuf)
 		if err == io.EOF {
 			break
 		}
@@ -212,14 +186,14 @@ func (w *WALWriter) rebuildIndex() error {
 
 		length := int64(binary.BigEndian.Uint32(lenBuf))
 
-		if length < 0 || length > int64(maxRecordSize) {
+		if length < 0 || length > int64(MaxRecordSize) {
 			return &CorruptionError{
 				Offset: pos,
 				Reason: fmt.Sprintf("length out of bounds: %d", length),
 			}
 		}
 
-		_, err = io.ReadFull(w.WalFile, crcBuf)
+		_, err = io.ReadFull(w.file, crcBuf)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return w.truncateTorn(pos)
 		}
@@ -229,7 +203,7 @@ func (w *WALWriter) rebuildIndex() error {
 		storedCRC := binary.BigEndian.Uint32(crcBuf)
 
 		payload := make([]byte, length)
-		_, err = io.ReadFull(w.WalFile, payload)
+		_, err = io.ReadFull(w.file, payload)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return w.truncateTorn(pos)
 		}
@@ -249,20 +223,22 @@ func (w *WALWriter) rebuildIndex() error {
 			}
 		}
 
-		offset := uint64(w.inMemoryStore.Len())
-		w.inMemoryStore.Put(offset, pos)
-		pos += recordHeaderSize + length
+		offset := uint64(w.store.Len())
+		w.store.Put(offset, pos)
+		recordCount++
+		pos += RecordHeaderSize + length
 	}
 
-	_, err := w.WalFile.Seek(0, io.SeekEnd)
+	w.store.ResetCounter(recordCount)
+
+	_, err := w.file.Seek(0, io.SeekEnd)
 	return err
 }
 
-// truncateTorn cuts off a half-written record left by a crash.
 func (w *WALWriter) truncateTorn(validEnd int64) error {
-	if err := w.WalFile.Truncate(validEnd); err != nil {
+	if err := w.file.Truncate(validEnd); err != nil {
 		return fmt.Errorf("wal: truncate torn record at %d: %w", validEnd, err)
 	}
-	_, err := w.WalFile.Seek(0, io.SeekEnd)
+	_, err := w.file.Seek(0, io.SeekEnd)
 	return err
 }
