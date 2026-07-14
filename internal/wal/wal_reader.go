@@ -75,7 +75,7 @@ func (r *WALReader) ReadAt(offset uint64) ([]byte, error) {
 	}
 
 	// 5. Verify CRC32C over (length || payload).
-	computedCRC := crc32.Checksum(lenBuf, r.table)
+	computedCRC := crc32.Checksum(lenBuf[:lengthSize], r.table)
 	computedCRC = crc32.Update(computedCRC, r.table, payload)
 	if computedCRC != storedCRC {
 		return nil, &CorruptionError{
