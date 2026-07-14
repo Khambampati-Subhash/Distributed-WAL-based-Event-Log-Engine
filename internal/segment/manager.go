@@ -93,9 +93,7 @@ type Manager struct {
 }
 
 type ManagerInterface interface {
-	active() *Segment
 	Append(data []byte) (uint64, error)
-	roll() error
 	ReadAt(offset uint64) ([]byte, error)
 	NextOffset() uint64
 	EarliestOffset() uint64
@@ -360,9 +358,11 @@ func (m *Manager) RunRetention() {
 		if err := os.Remove(seg.Path()); err != nil {
 			m.Metrics.DeleteErrors.Add(1)
 			log.Printf("segment: retention remove %s: %v", seg.Path(), err)
-			// Already detached from memory; a restart's discovery will re-find
-			// this file and retention will retry it then.
 			continue
+		}
+		if err := os.Remove(seg.IndexPath()); err != nil && !os.IsNotExist(err) {
+			m.Metrics.DeleteErrors.Add(1)
+			log.Printf("segment: retention remove index %s: %v", seg.IndexPath(), err)
 		}
 		m.Metrics.SegmentsDeleted.Add(1)
 		m.Metrics.BytesReclaimed.Add(size)

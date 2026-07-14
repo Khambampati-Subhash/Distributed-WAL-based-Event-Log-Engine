@@ -186,7 +186,7 @@ func (w *WALWriter) rebuildIndex() error {
 
 		length := int64(binary.BigEndian.Uint32(lenBuf))
 
-		if length < 0 || length > int64(MaxRecordSize) {
+		if length > int64(MaxRecordSize) {
 			return &CorruptionError{
 				Offset: pos,
 				Reason: fmt.Sprintf("length out of bounds: %d", length),

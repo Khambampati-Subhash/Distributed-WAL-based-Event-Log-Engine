@@ -143,6 +143,8 @@ func (s *Segment) waitReaders() { s.readers.Wait() }
 
 func (s *Segment) Path() string { return s.path }
 
+func (s *Segment) IndexPath() string { return indexFileName(s.path) }
+
 func (s *Segment) Close() error {
 	rerr := s.reader.Close()
 	werr := s.writer.Close()
