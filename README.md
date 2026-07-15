@@ -5,12 +5,12 @@ that powers Kafka. Producers **append** opaque byte events; consumers **read**
 them back **by offset**. Data is persisted to disk as a durable
 **Write-Ahead Log (WAL)** and survives restarts and crashes.
 
-> **Status: Phase 5 in progress — sparse index + InMemoryStore.**
-> Phases 1–4 are complete: durable append, CRC32C integrity, segmented files,
-> and time-based retention. Phase 5 adds a sparse on-disk index (every Nth
-> offset), an extracted `InMemoryStore` for index management, and consumer
-> offset batching. Networking and partitions come in later phases
-> (see [Roadmap](#roadmap)).
+> **Status: Phase 7 complete — TCP networking.**
+> Phases 1–6 are complete: durable append, CRC32C integrity, segmented files,
+> time-based retention, sparse on-disk index with extracted `InMemoryStore`,
+> and interface-driven dependencies. Phase 7 adds a TCP server and client so
+> producers and consumers can run in separate processes over the network.
+> Partitions and consumer groups come next (see [Roadmap](#roadmap)).
 
 ---
 
@@ -199,6 +199,80 @@ memory, so the next startup re-discovers and retries it.
 Run `go run ./cmd/retention` to see it: events roll into segments, the clock
 jumps past the window, retention deletes the old segments, and a stale consumer
 gets the loud reset.
+
+---
+
+## Networking (Phase 7)
+
+Until now everything ran in-process. Phase 7 exposes the log over **TCP** so
+producers and consumers can live in other processes or machines. Rather than
+pull in gRPC (and its dependency tree), the engine speaks its **own compact
+binary protocol** — the same design choice Kafka, Redis, and PostgreSQL all
+make. `go.mod` stays dependency-free.
+
+### Wire protocol
+
+Every message is length-prefixed so the reader always knows how many bytes to
+expect — this is what makes framing over a TCP byte-stream reliable.
+
+```
+Request   [ opcode : 1 ][ length : 4 ][ payload : N ]
+Response  [ status : 1 ][ length : 4 ][ payload : N ]
+```
+
+| Opcode | Request payload | OK response payload |
+|--------|-----------------|---------------------|
+| `Produce` | record bytes | 8-byte offset the record landed at |
+| `Read` | 8-byte offset | record bytes |
+| `NextOffset` | — | 8-byte next offset |
+| `EarliestOffset` | — | 8-byte earliest offset |
+| `StreamRead` | 8-byte start offset | a **sequence** of record frames, ended by a `StreamEnd` frame |
+
+`status` is `OK`, `Error` (payload is a UTF-8 message), or `StreamEnd`.
+
+### Streaming reads (one round-trip, not one-per-record)
+
+Reading a log one `Read(offset)` call at a time costs a full network round-trip
+per record. `StreamRead` sends **one** request and the server pushes every
+record from the start offset up to the head as a run of frames, terminated by a
+`StreamEnd` frame. The client tracks offsets itself (records arrive in order)
+and gets back the **next offset to resume from**, so a consumer can loop:
+
+```go
+next, _ := client.StreamRead(0, func(offset uint64, data []byte) error {
+    fmt.Printf("[%d] %s\n", offset, data)
+    return nil
+})
+// ... later, pick up whatever was appended since ...
+next, _ = client.StreamRead(next, handle)
+```
+
+A real read error mid-stream (corruption, out-of-retention) ends the stream
+with an `Error` frame instead of `StreamEnd`, so "something went wrong" is never
+confused with "caught up".
+
+### Connection lifecycle (don't leak goroutines)
+
+Each connection is served by its own goroutine. Two deadlines keep a dead or
+slow peer from holding that goroutine forever:
+
+- **`IdleTimeout`** bounds how long a connection may wait for and read the next
+  request. It reaps hung clients. It does *not* limit how long a stream takes to
+  send.
+- **`WriteTimeout`** bounds a single response (or stream frame) write, so a
+  consumer that stops reading is disconnected rather than blocking the server.
+
+```go
+srv, _ := network.NewServer(mgr, ":9876",
+    network.WithIdleTimeout(10*time.Minute),
+    network.WithWriteTimeout(30*time.Second))
+```
+
+> **Why not gRPC?** gRPC buys polyglot codegen, schema versioning, and built-in
+> streaming — at the cost of a large dependency tree and hiding the wire behind
+> generated stubs. For a from-scratch Kafka-style engine the custom protocol is
+> both more faithful and more instructive. gRPC remains a reasonable future
+> option if polyglot clients become a priority.
 
 ---
 
@@ -424,6 +498,13 @@ read in parallel without blocking the writer.
 
 ```
                      ┌─────────────────────────────────────┐
+   remote    TCP     │          network.Server              │
+   producer ────────►│  binary protocol over TCP            │
+   remote    TCP     │  [opcode:1][length:4][payload:N]     │
+   consumer ◄────────│  concurrent client connections       │
+                     └───────────────┬─────────────────────┘
+                                     │
+                     ┌───────────────▼─────────────────────┐
    producer ─Append─►│         segment.Manager              │
                      │  ordered segments, active, roll,     │
                      │  route reads, retention loop         │
@@ -463,10 +544,13 @@ read in parallel without blocking the writer.
 | `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), CRC32C, recovery. |
 | `internal/inmemorystore` | In-memory offset-to-position map + sparse on-disk `.index` file management. |
 | `internal/segment` | Splits the log into base-offset segment files; `Manager` routes append/read + rolls, `Reader` is a cross-segment cursor. |
+| `internal/network` | TCP server + client: binary protocol for produce/read/offsets over the network. |
 | `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery (supports batched writes). |
 | `cmd` | Single-flow demo (durable + CRC + segments + consumer offset). |
 | `cmd/concurrent` | Multi-producer/consumer demo with live lag metrics. |
 | `cmd/retention` | Retention demo: age out segments + loud consumer reset. |
+| `cmd/server` | Standalone TCP server wrapping the segment manager. |
+| `cmd/client` | CLI client that produces events and reads them back over TCP. |
 
 ---
 
@@ -481,6 +565,11 @@ go run -race ./cmd/concurrent
 
 # Retention: segments age out, stale consumer gets loud reset
 go run ./cmd/retention
+
+# Networked: start a TCP server, then produce and consume from a client
+go run ./cmd/server                   # terminal 1: starts on :9876
+go run ./cmd/client -n 20             # terminal 2: produce 20 events + read all
+go run ./cmd/client -addr host:port   # connect to a remote server
 ```
 
 Basic demo output:
@@ -560,8 +649,8 @@ phase.
 | **3 — Segments** | One file → many segment files in one directory, base-offset filenames, roll by size, per-segment index, startup discovery, cross-segment reads | log segmentation, base offsets |
 | **4 — Retention** | Background deletion of aged segments (never the active one); decide-under-lock/act-outside-lock; reader refcount; loud `OffsetOutOfRetentionError`; metrics | retention, background cleanup, lock discipline |
 | **5 — Index & Store** (in progress) | Sparse on-disk index (every Nth offset); `InMemoryStore` extraction; single-write-per-record; consumer offset batching | sparse indexing, separation of concerns |
-| 6 — Optimizations | `RWMutex` / atomic index lookups; benchmark-driven read path improvements; lazy segment fd management | lock-free reads, I/O optimization |
-| 7 — Network | Expose over TCP/gRPC so producers/consumers run in other processes | decoupling, wire protocols |
+| **6 — Optimizations** | `RWMutex` / atomic index lookups; interface-driven `InMemoryStore`; reader goes straight to the store (no writer contention) | lock-free reads, dependency inversion |
+| **7 — Network** | Custom length-prefixed binary protocol over TCP; produce/read/offset ops; streaming consumer reads; connection deadlines; standalone server + client | decoupling, wire protocols, framing |
 | 8 — Partitions & consumer groups | Many independent logs (e.g. per key), per-partition offsets, group coordination | horizontal scale |
 
 ---
@@ -572,6 +661,8 @@ phase.
 cmd/main.go                                  # single-flow demo
 cmd/concurrent/main.go                       # multi-producer/consumer + lag metrics
 cmd/retention/main.go                        # retention demo + loud reset
+cmd/server/main.go                           # standalone TCP server
+cmd/client/main.go                           # TCP client: produce + streaming consume
 internal/
   wal/wal_writer.go                          # per-file durable append + CRC + recovery
   wal/wal_reader.go                          # per-file positional reads by offset
@@ -584,6 +675,10 @@ internal/
   segment/reader.go                          # cross-segment Next() cursor + reset
   segment/manager_test.go                    # segment roll + recovery tests
   segment/retention_test.go                  # retention + concurrent safety tests
+  network/protocol.go                        # length-prefixed binary request/response framing
+  network/server.go                          # TCP server: dispatch, streaming, deadlines
+  network/client.go                          # TCP client: produce/read/stream
+  network/server_test.go                     # protocol + concurrency + streaming tests
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic replace + batching)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
 ```

@@ -8,6 +8,17 @@ A phase-by-phase record of **what** we built, **why** we chose it, the
 ## Architecture flow (current)
 
 ```
+                    REMOTE PRODUCERS / CONSUMERS  (other processes)
+                             │                                 ▲
+                             │ TCP: [op:1][len:4][payload]     │ frames
+                             ▼                                 │
+             ┌───────────────────────────────────────────────────────────┐
+             │                     network.Server                        │
+             │  • length-prefixed binary protocol over TCP              │
+             │  • Produce / Read / NextOffset / EarliestOffset / Stream  │
+             │  • per-conn goroutine + idle/write deadlines             │
+             └───────────────┬───────────────────────────────────────────┘
+                             │ (in-process API)
                          PRODUCERS                         CONSUMERS
                              │                                 │
                              │ Append([]byte)                  │ Next() / ReadAt(offset)
@@ -146,7 +157,7 @@ fallback); metrics (deleted / bytesReclaimed / deleteErrors / runs).
 - Full index still in RAM → **Phase 5 (sparse index on disk, full in memory)**
 - Single node; no replication → **Phase 7/8**
 
-## Phase 5 — Index & Store  (in progress)
+## Phase 5 — Index & Store  (done)
 
 **Built so far:**
 - **InMemoryStore** — extracted the in-memory `map[offset]→bytePos` from
@@ -180,20 +191,71 @@ fallback); metrics (deleted / bytesReclaimed / deleteErrors / runs).
 
 ---
 
-## Phase 6 — Optimizations (next)
+## Phase 6 — Optimizations (done)
 
-**Goal:** make the read hot path cheaper without changing any guarantee.
+**Built:**
+- **Interface-driven `InMemoryStore`** — the store is now behind
+  `InMemoryStoreInterface`; both `WALWriter` and `WALReader` depend on the
+  interface, not the concrete type ("accept interfaces, return structs").
+- **Reader → store directly** — `WALReader` looks up offset→position through the
+  store's `RWMutex` `Get` (RLock), so reads never contend with the writer's
+  append mutex.
+- **Thread-safe store** — `sync.RWMutex`: `Get`/`Len` take RLock, mutations take
+  Lock; verified under `-race`.
 
-**Scope:**
-1. **`RWMutex` or atomic index lookups** — `PositionOf` currently takes the write
-   mutex, so readers contend with the writer. Switch to `RWMutex` so lookups
-   don't serialize against appends.
-2. **Benchmark-driven read path** — measure single-read vs multi-read; combine
-   reads only if the numbers justify it.
-3. **Lazy segment fd management** — don't keep every segment file open; open on
-   demand and cache a bounded number of handles.
-4. **Fsync batching** — group multiple appends before fsyncing to amortize the
-   cost (trades latency for throughput).
+**Still deferred (nice-to-have, not blocking):** lazy segment fd management and
+fsync batching. Left for later; not required to move to networking.
+
+---
+
+## Phase 7 — Network (done)
+
+**Goal:** let producers and consumers run in **other processes / machines**,
+not just in-process.
+
+**Decision — custom binary protocol over TCP, not gRPC.** Considered gRPC
+(polyglot codegen, schema versioning, built-in streaming) but rejected it for
+now: it adds a large dependency tree and hides the wire behind generated stubs.
+A from-scratch Kafka-style engine is more faithful and more instructive with its
+own protocol, and `go.mod` stays dependency-free. gRPC remains a future option
+if polyglot clients become a priority.
+
+**Built:**
+- **Length-prefixed framing** (`internal/network/protocol.go`) —
+  `Request [opcode:1][length:4][payload:N]`,
+  `Response [status:1][length:4][payload:N]`. Length prefixes make framing over
+  a raw TCP byte-stream reliable.
+- **Operations** — `Produce`, `Read`, `NextOffset`, `EarliestOffset`, and
+  `StreamRead`. Each maps to the existing `segment.Manager` methods, so the
+  network layer is a thin transport over the same core.
+- **Streaming reads** — `StreamRead` sends one request; the server pushes every
+  record from the start offset to the head as a run of frames, ended by a
+  `StreamEnd` frame. Kills the round-trip-per-record cost of naive `Read` loops.
+  Client tracks offsets itself (records arrive in order) and gets the next
+  offset to resume from.
+- **Connection deadlines** — `IdleTimeout` bounds waiting-for/reading a request
+  (reaps dead peers); `WriteTimeout` bounds a single response/frame write (a
+  consumer that stops reading is disconnected, not left blocking a goroutine).
+  Configured via functional options (`WithIdleTimeout`, `WithWriteTimeout`).
+- **Standalone binaries** — `cmd/server` (wraps a `segment.Manager` over TCP,
+  graceful SIGINT/SIGTERM shutdown) and `cmd/client` (produces events, then
+  streams them back).
+
+**Why these decisions:**
+- *Length-prefix everything* — the only reliable way to frame messages on a
+  byte-stream; the reader always knows how many bytes a message is.
+- *Errors are frames, not silence* — a mid-stream read error ends the stream
+  with an `Error` frame, never a `StreamEnd`, so "something broke" is never
+  confused with "caught up" (same philosophy as CRC and retention).
+- *Deadlines over unbounded goroutines* — a networked server must assume peers
+  die mid-request; without deadlines each dead peer leaks a goroutine forever.
+
+**Limitations left behind → fixed in:**
+- No live "tail -f" (blocking wait for new records) — `StreamRead` drains to the
+  current head and stops; a consumer re-calls to pick up new records. A push
+  subscription needs a notification hook in `Manager` → **future phase**
+- No auth / TLS — plaintext, trusted-network only → **future phase**
+- Single node; one log; no replication or partitions → **Phase 8**
 
 ---
 
