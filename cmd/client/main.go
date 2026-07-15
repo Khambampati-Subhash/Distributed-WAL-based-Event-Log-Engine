@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/network"
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/client"
 )
 
 func main() {
@@ -14,7 +14,7 @@ func main() {
 	count := flag.Int("n", 10, "number of events to produce")
 	flag.Parse()
 
-	c, err := network.NewClient(*addr)
+	c, err := client.New(*addr)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}

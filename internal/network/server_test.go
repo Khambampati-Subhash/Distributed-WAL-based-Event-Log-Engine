@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/client"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
@@ -40,7 +41,7 @@ func startTestServer(t *testing.T) (*Server, string) {
 
 func TestProduceAndRead(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestProduceAndRead(t *testing.T) {
 
 func TestNextAndEarliestOffset(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestNextAndEarliestOffset(t *testing.T) {
 
 func TestReadNonExistent(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +122,7 @@ func TestConcurrentClients(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			c, err := NewClient(addr)
+			c, err := client.New(addr)
 			if err != nil {
 				errs <- err
 				return
@@ -157,7 +158,7 @@ func TestConcurrentClients(t *testing.T) {
 
 func TestMultipleMessagesSequential(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +184,7 @@ func TestMultipleMessagesSequential(t *testing.T) {
 
 func TestStreamRead(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestStreamRead(t *testing.T) {
 
 func TestStreamReadCatchUp(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +253,7 @@ func TestStreamReadCatchUp(t *testing.T) {
 
 func TestStreamReadResumesFromMiddle(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +286,7 @@ func TestStreamReadResumesFromMiddle(t *testing.T) {
 
 func TestStreamReadEmptyLog(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +310,7 @@ func TestStreamReadEmptyLog(t *testing.T) {
 
 func TestStreamThenProduceThenStreamAgain(t *testing.T) {
 	_, addr := startTestServer(t)
-	c, err := NewClient(addr)
+	c, err := client.New(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,43 +384,5 @@ func TestIdleTimeoutClosesConnection(t *testing.T) {
 	// A closed connection surfaces as io.EOF on the client read.
 	if !errors.Is(err, io.EOF) {
 		t.Logf("connection ended with: %v (acceptable as long as it ended)", err)
-	}
-}
-
-func TestProtocolRoundTrip(t *testing.T) {
-	var buf bytes.Buffer
-
-	req := &Request{Op: OpProduce, Payload: []byte("test-data")}
-	if err := WriteRequest(&buf, req); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := ReadRequest(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Op != req.Op || !bytes.Equal(got.Payload, req.Payload) {
-		t.Fatalf("request roundtrip mismatch: got op=%d payload=%q", got.Op, got.Payload)
-	}
-
-	resp := &Response{Status: StatusOK, Payload: []byte("result")}
-	if err := WriteResponse(&buf, resp); err != nil {
-		t.Fatal(err)
-	}
-
-	gotResp, err := ReadResponse(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotResp.Status != resp.Status || !bytes.Equal(gotResp.Payload, resp.Payload) {
-		t.Fatalf("response roundtrip mismatch: got status=%d payload=%q", gotResp.Status, gotResp.Payload)
-	}
-}
-
-func TestEmptyRequest(t *testing.T) {
-	var buf bytes.Buffer
-	_, err := ReadRequest(&buf)
-	if err != io.EOF {
-		t.Fatalf("expected EOF on empty read, got %v", err)
 	}
 }

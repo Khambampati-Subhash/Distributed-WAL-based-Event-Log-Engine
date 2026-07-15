@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/protocol"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
@@ -112,7 +113,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
-		req, err := ReadRequest(conn)
+		req, err := protocol.ReadRequest(conn)
 		if err != nil {
 			// EOF/closed/idle-timeout are normal ways a connection ends: stay quiet.
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
@@ -124,7 +125,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		// Streaming writes many frames for one request, so it owns the conn directly.
-		if req.Op == OpStreamRead {
+		if req.Op == protocol.OpStreamRead {
 			if err := s.handleStreamRead(conn, req.Payload); err != nil {
 				return
 			}
@@ -137,35 +138,35 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) writeResponse(conn net.Conn, resp *Response) error {
+func (s *Server) writeResponse(conn net.Conn, resp *protocol.Response) error {
 	if s.cfg.WriteTimeout > 0 {
 		if err := conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
 			return err
 		}
 	}
-	if err := WriteResponse(conn, resp); err != nil {
+	if err := protocol.WriteResponse(conn, resp); err != nil {
 		log.Printf("network: write response: %v", err)
 		return err
 	}
 	return nil
 }
 
-func (s *Server) dispatch(req *Request) *Response {
+func (s *Server) dispatch(req *protocol.Request) *protocol.Response {
 	switch req.Op {
-	case OpProduce:
+	case protocol.OpProduce:
 		return s.handleProduce(req.Payload)
-	case OpRead:
+	case protocol.OpRead:
 		return s.handleRead(req.Payload)
-	case OpNextOffset:
+	case protocol.OpNextOffset:
 		return s.handleNextOffset()
-	case OpEarliestOffset:
+	case protocol.OpEarliestOffset:
 		return s.handleEarliestOffset()
 	default:
 		return errorResponse(fmt.Sprintf("unknown opcode: %d", req.Op))
 	}
 }
 
-func (s *Server) handleProduce(data []byte) *Response {
+func (s *Server) handleProduce(data []byte) *protocol.Response {
 	if len(data) == 0 {
 		return errorResponse("empty payload")
 	}
@@ -175,10 +176,10 @@ func (s *Server) handleProduce(data []byte) *Response {
 	}
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], offset)
-	return &Response{Status: StatusOK, Payload: buf[:]}
+	return &protocol.Response{Status: protocol.StatusOK, Payload: buf[:]}
 }
 
-func (s *Server) handleRead(payload []byte) *Response {
+func (s *Server) handleRead(payload []byte) *protocol.Response {
 	if len(payload) != 8 {
 		return errorResponse("read requires 8-byte offset")
 	}
@@ -187,19 +188,19 @@ func (s *Server) handleRead(payload []byte) *Response {
 	if err != nil {
 		return errorResponse(err.Error())
 	}
-	return &Response{Status: StatusOK, Payload: data}
+	return &protocol.Response{Status: protocol.StatusOK, Payload: data}
 }
 
-func (s *Server) handleNextOffset() *Response {
+func (s *Server) handleNextOffset() *protocol.Response {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], s.manager.NextOffset())
-	return &Response{Status: StatusOK, Payload: buf[:]}
+	return &protocol.Response{Status: protocol.StatusOK, Payload: buf[:]}
 }
 
-func (s *Server) handleEarliestOffset() *Response {
+func (s *Server) handleEarliestOffset() *protocol.Response {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], s.manager.EarliestOffset())
-	return &Response{Status: StatusOK, Payload: buf[:]}
+	return &protocol.Response{Status: protocol.StatusOK, Payload: buf[:]}
 }
 
 // handleStreamRead sends every record from the requested start offset up to the
@@ -223,14 +224,14 @@ func (s *Server) handleStreamRead(conn net.Conn, payload []byte) error {
 			}
 			return s.writeResponse(conn, errorResponse(err.Error()))
 		}
-		if err := s.writeResponse(conn, &Response{Status: StatusOK, Payload: data}); err != nil {
+		if err := s.writeResponse(conn, &protocol.Response{Status: protocol.StatusOK, Payload: data}); err != nil {
 			return err
 		}
 		offset++
 	}
-	return s.writeResponse(conn, &Response{Status: StatusStreamEnd})
+	return s.writeResponse(conn, &protocol.Response{Status: protocol.StatusStreamEnd})
 }
 
-func errorResponse(msg string) *Response {
-	return &Response{Status: StatusError, Payload: []byte(msg)}
+func errorResponse(msg string) *protocol.Response {
+	return &protocol.Response{Status: protocol.StatusError, Payload: []byte(msg)}
 }

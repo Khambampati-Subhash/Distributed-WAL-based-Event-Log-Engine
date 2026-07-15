@@ -274,6 +274,33 @@ srv, _ := network.NewServer(mgr, ":9876",
 > both more faithful and more instructive. gRPC remains a reasonable future
 > option if polyglot clients become a priority.
 
+### Using the client as a library
+
+The **`client` package is the only public package** — everything else lives
+under `internal/`, which Go's toolchain forbids other modules from importing.
+So the engine is consumed exactly one way from outside: run the server, and
+talk to it with the client.
+
+```go
+import "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/client"
+
+c, err := client.New("log-host:9876")
+if err != nil { /* ... */ }
+defer c.Close()
+
+off, _ := c.Produce([]byte("order.created"))   // producer app
+
+next, _ := c.StreamRead(0, func(offset uint64, data []byte) error {
+    fmt.Printf("[%d] %s\n", offset, data)       // consumer app
+    return nil
+})
+```
+
+The client depends only on the wire protocol, not the storage engine, so a
+producer or consumer binary stays small. Producer, server, and consumer are
+**three independent processes** — start the server once, then run as many
+producer and consumer programs as you like, on any machine that can reach it.
+
 ---
 
 ## Storage & Durability
@@ -544,7 +571,9 @@ read in parallel without blocking the writer.
 | `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), CRC32C, recovery. |
 | `internal/inmemorystore` | In-memory offset-to-position map + sparse on-disk `.index` file management. |
 | `internal/segment` | Splits the log into base-offset segment files; `Manager` routes append/read + rolls, `Reader` is a cross-segment cursor. |
-| `internal/network` | TCP server + client: binary protocol for produce/read/offsets over the network. |
+| `internal/protocol` | The length-prefixed binary wire format — the single source of truth shared by server and client. Engine-free. |
+| `internal/network` | TCP **server**: accepts connections, dispatches ops to the segment manager, streams reads, enforces deadlines. |
+| **`client`** (public) | TCP **client** — the one package an external program imports to produce/consume over the network. Depends only on `internal/protocol`, not the engine. |
 | `internal/consumeroffset` | Persist & load a consumer's committed offset for crash recovery (supports batched writes). |
 | `cmd` | Single-flow demo (durable + CRC + segments + consumer offset). |
 | `cmd/concurrent` | Multi-producer/consumer demo with live lag metrics. |
@@ -663,6 +692,7 @@ cmd/concurrent/main.go                       # multi-producer/consumer + lag met
 cmd/retention/main.go                        # retention demo + loud reset
 cmd/server/main.go                           # standalone TCP server
 cmd/client/main.go                           # TCP client: produce + streaming consume
+client/client.go                             # PUBLIC remote client library (the only importable package)
 internal/
   wal/wal_writer.go                          # per-file durable append + CRC + recovery
   wal/wal_reader.go                          # per-file positional reads by offset
@@ -675,10 +705,10 @@ internal/
   segment/reader.go                          # cross-segment Next() cursor + reset
   segment/manager_test.go                    # segment roll + recovery tests
   segment/retention_test.go                  # retention + concurrent safety tests
-  network/protocol.go                        # length-prefixed binary request/response framing
+  protocol/protocol.go                       # length-prefixed binary request/response framing (shared)
+  protocol/protocol_test.go                  # framing round-trip + oversize-guard tests
   network/server.go                          # TCP server: dispatch, streaming, deadlines
-  network/client.go                          # TCP client: produce/read/stream
-  network/server_test.go                     # protocol + concurrency + streaming tests
+  network/server_test.go                     # server + concurrency + streaming tests
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic replace + batching)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
 ```

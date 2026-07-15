@@ -1,4 +1,8 @@
-package network
+// Package protocol defines the length-prefixed binary wire format shared by the
+// TCP server and client. It is the single source of truth for the on-the-wire
+// framing so the two sides can never drift. It has no dependency on the storage
+// engine — it is pure transport.
+package protocol
 
 import (
 	"encoding/binary"

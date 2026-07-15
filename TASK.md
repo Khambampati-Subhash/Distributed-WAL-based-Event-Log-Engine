@@ -240,6 +240,14 @@ if polyglot clients become a priority.
 - **Standalone binaries** — `cmd/server` (wraps a `segment.Manager` over TCP,
   graceful SIGINT/SIGTERM shutdown) and `cmd/client` (produces events, then
   streams them back).
+- **Public client library** — the wire format lives in `internal/protocol`
+  (shared, engine-free) and the client is promoted to a public `client` package
+  at the module root. It is the **only** importable package: everything else is
+  under `internal/`, which Go forbids other modules from importing. So an
+  external producer/consumer app does `client.New(addr)` and nothing else leaks.
+  The client depends only on `internal/protocol`, not the engine, so a
+  producer/consumer binary stays small. (Verified: an external module compiles
+  against `client` but is blocked from `internal/segment`.)
 
 **Why these decisions:**
 - *Length-prefix everything* — the only reliable way to frame messages on a
