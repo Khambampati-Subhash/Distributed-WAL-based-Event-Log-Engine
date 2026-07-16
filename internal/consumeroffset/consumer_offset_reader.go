@@ -1,4 +1,4 @@
-package offset
+package consumeroffset
 
 import (
 	"encoding/binary"

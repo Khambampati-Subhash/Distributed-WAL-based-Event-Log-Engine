@@ -662,6 +662,34 @@ Key test coverage:
 - **Recovery**: reopen directory, rebuild indexes, continue at correct offset
 - **Retention**: aged segments deleted, active never deleted, stale consumer gets loud error
 - **Retention + concurrency**: retention runs while producers append and consumers read
+- **Networking**: produce/read/offset ops, streaming catch-up/resume, idle-timeout reaping
+- **Consumer offsets**: durable round-trip + batched-commit threshold behavior
+
+The codebase is `gofmt`-clean and passes `go vet` and `staticcheck` with no
+findings. Core packages sit around 75–82% statement coverage.
+
+---
+
+## Production readiness & limitations
+
+This is a **learning project built phase by phase**, and it is honest about
+what it is not yet. The engineering that *is* done is real — durability with
+fsync + directory fsync, CRC32C verified on every read, crash recovery with
+torn-tail truncation, lock-discipline that never holds a mutex across disk I/O,
+interface-based dependency injection, and a clean transport/engine split. What
+separates it from production-grade:
+
+| Area | Current state | Needed for production |
+|------|---------------|-----------------------|
+| **Replication / HA** | Single node. Data is durable on its disk, but if the node is down the log is unavailable. | Leader/follower replication, failover. |
+| **On-disk sparse index** | Written every Nth append but **not yet used** by recovery (startup still full-scans the WAL). | Wire it into recovery, or drop it. |
+| **File descriptors** | Every segment stays open. | Lazy open + bounded fd cache. |
+| **Transport security** | Plaintext TCP, no auth. Trusted-network only. | TLS + authentication. |
+| **Consumer offsets over the wire** | Tracked client-side; no server-side commit op. | Offset-commit RPC + consumer groups. |
+| **Client hardening** | Dial timeout added; no per-request deadline yet. | Per-call deadlines / context cancellation. |
+
+Partitions, consumer groups, and replication are the roadmap items that move it
+toward "distributed" in the full sense.
 
 ---
 
@@ -711,4 +739,5 @@ internal/
   network/server_test.go                     # server + concurrency + streaming tests
   consumeroffset/consumer_offset_writer.go   # commit offset (atomic replace + batching)
   consumeroffset/consumer_offset_reader.go   # load offset on restart
+  consumeroffset/consumer_offset_test.go     # offset round-trip + batch-threshold tests
 ```

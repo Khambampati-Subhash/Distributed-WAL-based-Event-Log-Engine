@@ -24,18 +24,29 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/protocol"
 )
+
+// DefaultDialTimeout bounds how long New waits to establish a connection before
+// giving up, so a dead or unreachable server fails fast instead of hanging.
+const DefaultDialTimeout = 10 * time.Second
 
 type Client struct {
 	mu   sync.Mutex
 	conn net.Conn
 }
 
-// New dials the server at addr (host:port) and returns a connected client.
+// New dials the server at addr (host:port) with DefaultDialTimeout.
 func New(addr string) (*Client, error) {
-	conn, err := net.Dial("tcp", addr)
+	return NewWithTimeout(addr, DefaultDialTimeout)
+}
+
+// NewWithTimeout dials the server at addr, giving up after dialTimeout. A
+// dialTimeout of 0 waits indefinitely (the OS default).
+func NewWithTimeout(addr string, dialTimeout time.Duration) (*Client, error) {
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("client: dial %s: %w", addr, err)
 	}

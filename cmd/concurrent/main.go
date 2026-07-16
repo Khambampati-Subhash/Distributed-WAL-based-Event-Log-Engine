@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	offset "github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/consumeroffset"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/segment"
 )
 
@@ -147,8 +147,8 @@ func runConsumer(
 	defer reader.Close()
 
 	// Resume from last committed offset (0 for a fresh consumer).
-	offsetWriter := offset.NewOffsetWriter(offsetPath, 20)
-	resume, err := offset.NewOffsetReader(offsetPath).Read()
+	offsetWriter := consumeroffset.NewOffsetWriter(offsetPath, 20)
+	resume, err := consumeroffset.NewOffsetReader(offsetPath).Read()
 	if err != nil {
 		log.Printf("consumer %s: %v", spec.name, err)
 		return

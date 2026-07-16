@@ -1,4 +1,4 @@
-package offset
+package consumeroffset
 
 import (
 	"encoding/binary"
@@ -29,20 +29,32 @@ func NewOffsetWriter(path string, nthOffset uint32) *OffsetWriter {
 	return &OffsetWriter{path: path, nthOffset: nthOffset}
 }
 
-// instead of storing each offset in file everytime we can batch it
+// BatchWrite persists offset only once at least nthOffset records of progress
+// have accumulated since the last durable commit, amortizing the fsync cost.
+// The trade-off is explicit: after a crash the consumer may re-process up to
+// nthOffset-1 already-handled records, so consumers using it must be idempotent.
+// Call Write directly for a guaranteed final commit.
 func (w *OffsetWriter) BatchWrite(offset uint64) error {
-	if offset-w.previousOffset == uint64(w.nthOffset) {
-		w.previousOffset = offset
-		return w.Write(offset)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// >= (not ==) so a consumer that advances in jumps still flushes; an exact
+	// match would silently never persist if progress ever skipped the boundary.
+	if offset < w.previousOffset+uint64(w.nthOffset) {
+		return nil
 	}
-	return nil
+	w.previousOffset = offset
+	return w.writeLocked(offset)
 }
 
 // Write durably persists offset as the consumer's committed position.
 func (w *OffsetWriter) Write(offset uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.writeLocked(offset)
+}
 
+// writeLocked does the atomic tmp+fsync+rename+dir-fsync dance. Caller holds mu.
+func (w *OffsetWriter) writeLocked(offset uint64) error {
 	tmp := w.path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -67,7 +79,7 @@ func (w *OffsetWriter) Write(offset uint64) error {
 		return fmt.Errorf("offset: rename %q -> %q: %w", tmp, w.path, err)
 	}
 	if err := fsyncDir(filepath.Dir(w.path)); err != nil {
-		return fmt.Errorf("error while fsync the dir: %s", err)
+		return fmt.Errorf("offset: fsync dir: %w", err)
 	}
 	return nil
 }
