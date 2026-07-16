@@ -13,8 +13,13 @@ import (
 
 func newTestWriter(t *testing.T, path string) (*WALWriter, *inmemorystore.InMemoryStore) {
 	t.Helper()
+	return newTestWriterNth(t, path, NthIndex)
+}
+
+func newTestWriterNth(t *testing.T, path string, nth uint32) (*WALWriter, *inmemorystore.InMemoryStore) {
+	t.Helper()
 	idxPath := path + ".index"
-	store, err := inmemorystore.NewInMemoryStore(idxPath, NthIndex)
+	store, err := inmemorystore.NewInMemoryStore(idxPath, nth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +29,55 @@ func newTestWriter(t *testing.T, path string) (*WALWriter, *inmemorystore.InMemo
 		t.Fatal(err)
 	}
 	return w, store
+}
+
+// TestCheckpointRecoveryAndForwardScan writes enough records that real
+// checkpoints are persisted, then reopens with a FRESH store — so recovery must
+// reload checkpoints from disk and scan the tail — and verifies every record is
+// still readable by its offset (which exercises the Floor + forward-scan path).
+func TestCheckpointRecoveryAndForwardScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.log")
+	const n = 50
+	const nth = 4 // dense checkpoints so recovery reloads several
+
+	w, store := newTestWriterNth(t, path, nth)
+	for i := 0; i < n; i++ {
+		if _, err := w.Write(fmt.Appendf(nil, "record-%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	store.Close()
+
+	// Reopen from scratch: a new store loads checkpoints from the .index file.
+	w2, store2 := newTestWriterNth(t, path, nth)
+	defer w2.Close()
+	defer store2.Close()
+
+	if got := w2.NextOffset(); got != n {
+		t.Fatalf("recovered NextOffset = %d, want %d", got, n)
+	}
+
+	r, err := NewWALReader(path, store2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// Read every offset, including ones that are NOT checkpoints (forces the
+	// forward scan from the nearest checkpoint).
+	for i := 0; i < n; i++ {
+		data, err := r.ReadAt(uint64(i))
+		if err != nil {
+			t.Fatalf("read offset %d after recovery: %v", i, err)
+		}
+		if want := fmt.Sprintf("record-%03d", i); string(data) != want {
+			t.Fatalf("offset %d: got %q want %q", i, data, want)
+		}
+	}
+	if _, err := r.ReadAt(n); err != io.EOF {
+		t.Fatalf("reading past head should be io.EOF, got %v", err)
+	}
 }
 
 func TestWriteReadRecover(t *testing.T) {

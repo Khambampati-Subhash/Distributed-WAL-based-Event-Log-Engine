@@ -184,10 +184,18 @@ fallback); metrics (deleted / bytesReclaimed / deleteErrors / runs).
   which would return incorrect results for sparse maps.
 - Duplicate index file handles between WALWriter and InMemoryStore consolidated.
 
-**Still TODO in this phase:**
-- Use the sparse on-disk index to speed up recovery (seek to nearest indexed
-  position, scan forward) instead of always doing a full WAL scan.
-- Benchmark before/after to prove the wins.
+**Completed later (checkpoint-based recovery):**
+- The sparse `.index` is now the **recovery source**. On startup the store loads
+  its checkpoints, the writer jumps to the last one and scans only the tail to
+  find the head + truncate a torn record — no full WAL rescan.
+- The in-memory index became genuinely **sparse** (checkpoints only, not every
+  offset). Reads take the nearest checkpoint (`Floor`, binary search) and scan
+  forward ≤ N records to the target.
+- **Guarantee change (accepted):** recovery no longer CRC-verifies the whole log
+  at startup; integrity is enforced on every read instead. `TestCRCDetectsBitRot`
+  became `TestCRCDetectsBitRotOnRead` to reflect this.
+- Interface slimmed to `LoadCheckpoints / Floor / Checkpoint / Close`; the writer
+  tracks `nextOffset` itself instead of inferring it from a full map's length.
 
 ---
 

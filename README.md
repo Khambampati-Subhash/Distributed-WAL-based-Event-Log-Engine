@@ -5,11 +5,12 @@ that powers Kafka. Producers **append** opaque byte events; consumers **read**
 them back **by offset**. Data is persisted to disk as a durable
 **Write-Ahead Log (WAL)** and survives restarts and crashes.
 
-> **Status: Phase 7 complete — TCP networking.**
+> **Status: Phase 7 complete — TCP networking + public client library.**
 > Phases 1–6 are complete: durable append, CRC32C integrity, segmented files,
-> time-based retention, sparse on-disk index with extracted `InMemoryStore`,
-> and interface-driven dependencies. Phase 7 adds a TCP server and client so
-> producers and consumers can run in separate processes over the network.
+> time-based retention, and a **sparse checkpoint index that now drives recovery**
+> (startup loads checkpoints + tail-scan instead of a full WAL rescan; reads seek
+> to the nearest checkpoint and scan forward). Phase 7 adds a TCP server and a
+> public `client` package so producers and consumers run in separate processes.
 > Partitions and consumer groups come next (see [Roadmap](#roadmap)).
 
 ---
@@ -55,22 +56,35 @@ next `N` payload bytes and verify the CRC. `len` and `crc` are big-endian
 `uint32`. The engine never looks inside the payload — it stores and returns
 **opaque bytes**. See [Integrity (CRC32C)](#integrity-crc32c) for why and how.
 
-### Index: in-memory map + sparse on-disk index file
+### Index: sparse checkpoints, not a full map
 
-The full map of `offset → byte position` is kept **in memory** (in the
-`InMemoryStore`) and **rebuilt by scanning the WAL file on startup**. Every
-record gets an entry in the in-memory map for fast lookups.
+The index is **sparse**: a checkpoint of `offset → byte position` is stored for
+every Nth record (currently every 10th), both in memory (`InMemoryStore`) and in
+an on-disk `.index` file. It is **not** a full map of every offset.
 
-A **sparse on-disk index file** (`.index`) stores every Nth offset-to-position
-mapping (currently every 10th). This enables faster recovery for large logs —
-instead of scanning the entire WAL, a future optimization can seek to the nearest
-indexed position and scan forward from there.
+**Recovery uses the checkpoints instead of a full WAL scan.** On startup the
+engine loads the checkpoints from the `.index` file, jumps to the last one, and
+scans only the short *tail* after it (at most N records) to find the true head
+and truncate a torn final record. A large log no longer pays a full front-to-back
+rescan to reopen.
+
+**Reads seek to the nearest checkpoint, then scan forward.** To read offset `X`,
+the reader takes the checkpoint with the greatest offset `≤ X` (`Floor`, a binary
+search) and scans records forward from there until it reaches `X` — bounded by N
+records. This is the classic Kafka trade-off: a sparse index costs a little on
+each read but saves memory and startup time.
 
 ```
-in memory:   Index = {0: 0, 1: 13, 2: 26, ...}   // every offset
-on disk:     .index = [(10, pos), (20, pos), ...]  // every 10th offset
-on startup:  scan WAL front-to-back, rebuild full index, drop any torn tail
+in memory:   checkpoints = [(0, pos), (10, pos), (20, pos), ...]  // every 10th
+on disk:     .index       = same, 16 bytes each (offset:u64, pos:u64)
+on startup:  load checkpoints → seek last → scan only the tail (no full scan)
+on read(X):  floor(X) → seek → scan forward ≤ N records → verify CRC → return
 ```
+
+> **Trade-off, stated plainly:** because recovery trusts the checkpoints, it no
+> longer CRC-verifies the whole log at startup. Integrity is instead verified on
+> **every read** (see below). A denser index (smaller N) shortens read scans at
+> the cost of more frequent checkpoint writes.
 
 ---
 
@@ -462,10 +476,12 @@ mis-frames the record (the reader reads the wrong number of bytes and everything
 after it shifts). Covering the length means that case is caught too. The CRC
 field itself is *not* covered — a checksum cannot checksum itself.
 
-### The 3-way recovery decision tree
+### The recovery decision tree (tail scan) + framing checks
 
-On startup the engine scans the file; each record falls into exactly one bucket,
-and each gets a **different** response:
+Since checkpoint-based recovery, startup no longer reads the whole log — it scans
+only the **tail** after the last checkpoint to find the head and handle a torn
+final record. That tail scan (and the forward scan a read performs) classifies
+each record's framing:
 
 ```
 read [len][crc][payload] at current position
@@ -474,11 +490,11 @@ read [len][crc][payload] at current position
 │                                            → truncate here, keep prior records
 │                                              (this is expected & safe)
 │
-├─ len < 0 or len > 64 MB (sanity cap)  ──► CORRUPT LENGTH field
+├─ len > 64 MB (sanity cap)  ─────────────► CORRUPT LENGTH field
 │                                            → return CorruptionError, STOP
 │
 └─ full record read, CRC ≠ stored  ───────► BIT-ROT in a complete record
-                                             → return CorruptionError, STOP
+   (checked on READ, not during recovery)    → return CorruptionError, STOP
 ```
 
 Two design choices worth calling out:
@@ -495,13 +511,14 @@ Two design choices worth calling out:
    the error lets an operator investigate (is the disk failing? are other files
    affected?) and decide. Never silently paper over corruption.
 
-### CRC is verified on *every read*, not just at startup
+### CRC is verified on *every read* — the single integrity checkpoint
 
-Bit-rot can strike a record *after* the engine has booted and indexed it. So the
-CRC is recomputed and checked inside `ReadAt` on **every** read, not only during
-the startup scan — otherwise we could serve corruption that appeared at runtime.
-Because CRC32C is hardware-accelerated, this per-read cost is negligible. (This
-is exactly what Kafka does.)
+Bit-rot can strike a record at any time, and recovery now trusts the sparse
+checkpoints rather than re-hashing the whole log at startup. So **read time is
+the point where integrity is enforced**: the CRC is recomputed and checked inside
+`ReadAt` on **every** read of the target record. Because CRC32C is
+hardware-accelerated, this per-read cost is negligible. (This is exactly what
+Kafka does — it does not re-verify the whole log on every restart either.)
 
 > **Format compatibility:** Phase-2 records carry 4 extra bytes (the CRC), so a
 > Phase-1 log file cannot be read by Phase-2 and vice versa. For this tagged
@@ -545,9 +562,9 @@ read in parallel without blocking the writer.
                                      │
                      ┌───────────────▼─────────────────────┐
                      │       inmemorystore.InMemoryStore     │
-                     │  in-memory map[offset]→bytePos       │
-                     │  sparse .index file (every Nth)      │
-                     │  rebuilt from WAL + index on startup  │
+                     │  sparse checkpoints: offset→bytePos  │
+                     │  .index file (every Nth), Floor()    │
+                     │  loaded on startup; tail-scan only    │
                      └─────────────────────────────────────┘
                                      │
                                      ▼
@@ -655,7 +672,8 @@ go test -race ./internal/segment/    # Segment roll + recovery + retention tests
 ```
 
 Key test coverage:
-- **CRC detection**: manufactured bit-rot is caught on startup and at runtime
+- **CRC detection**: manufactured bit-rot is caught on read (with a runtime read)
+- **Checkpoint recovery**: reopen loads sparse checkpoints + tail-scan; every offset still readable via Floor + forward scan
 - **Torn tail recovery**: crash mid-write → truncate, keep valid records
 - **Concurrent safety**: 8 producers + 8 readers under `-race`
 - **Segment rolling**: records spread across files, readable by global offset
@@ -682,7 +700,8 @@ separates it from production-grade:
 | Area | Current state | Needed for production |
 |------|---------------|-----------------------|
 | **Replication / HA** | Single node. Data is durable on its disk, but if the node is down the log is unavailable. | Leader/follower replication, failover. |
-| **On-disk sparse index** | Written every Nth append but **not yet used** by recovery (startup still full-scans the WAL). | Wire it into recovery, or drop it. |
+| **Startup integrity** | Recovery uses sparse checkpoints (no full scan), so it no longer CRC-verifies the whole log at startup — only on read. | Optional background scrubber to re-verify cold data. |
+| **Read cost** | Reads scan up to N records forward from the nearest checkpoint (sparse index). | Tune N, or add a hot-offset cache if read latency matters. |
 | **File descriptors** | Every segment stays open. | Lazy open + bounded fd cache. |
 | **Transport security** | Plaintext TCP, no auth. Trusted-network only. | TLS + authentication. |
 | **Consumer offsets over the wire** | Tracked client-side; no server-side commit op. | Offset-commit RPC + consumer groups. |

@@ -38,17 +38,18 @@ func (e *CorruptionError) Error() string {
 }
 
 type WALWriter struct {
-	mu    sync.Mutex
-	file  *os.File
-	table *crc32.Table
-	size  int64
-	store inmemorystore.InMemoryStoreInterface
+	mu         sync.Mutex
+	file       *os.File
+	table      *crc32.Table
+	size       int64
+	nextOffset uint64 // offset the next Write will assign
+	store      inmemorystore.InMemoryStoreInterface
 }
 
-// NewWalWriter opens (or creates) the log file and rebuilds the in-memory
-// index from whatever is already on disk, so the log survives a restart.
-// The caller provides the InMemoryStore that will hold offset-to-position
-// mappings; this decouples the writer from index file management.
+// NewWalWriter opens (or creates) the log file and recovers its head offset from
+// the sparse checkpoint index rather than a full scan: it loads the checkpoints,
+// jumps to the last one, and scans only the short tail after it to find the true
+// head and truncate any torn final record. The caller provides the store.
 func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface) (*WALWriter, error) {
 	_, statErr := os.Stat(filename)
 	isNew := os.IsNotExist(statErr)
@@ -70,17 +71,10 @@ func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface) (
 		table: crc32.MakeTable(crc32.Castagnoli),
 		store: store,
 	}
-	if err := w.rebuildIndex(); err != nil {
+	if err := w.recover(); err != nil {
 		file.Close()
 		return nil, err
 	}
-
-	size, err := file.Seek(0, io.SeekEnd)
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("wal: size after recovery: %w", err)
-	}
-	w.size = size
 	return w, nil
 }
 
@@ -129,12 +123,11 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 		return 0, fmt.Errorf("wal: fsync: %w", err)
 	}
 
-	offset := uint64(w.store.Len())
-
-	if err := w.store.WriteIndex(offset, uint64(pos)); err != nil {
+	offset := w.nextOffset
+	if err := w.store.Checkpoint(offset, pos); err != nil {
 		return 0, err
 	}
-	w.store.Put(offset, pos)
+	w.nextOffset++
 	w.size += RecordHeaderSize + int64(len(data))
 	return offset, nil
 }
@@ -148,7 +141,9 @@ func (w *WALWriter) Size() int64 {
 
 // NextOffset returns the offset the next Write will be assigned.
 func (w *WALWriter) NextOffset() uint64 {
-	return uint64(w.store.Len())
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.nextOffset
 }
 
 // Close closes the underlying WAL file. The caller is responsible for
@@ -159,86 +154,66 @@ func (w *WALWriter) Close() error {
 	return w.file.Close()
 }
 
-// rebuildIndex scans the WAL file on startup and reconstructs the in-memory
-// index. Also restores the sparse index counter so on-disk index entries
-// continue at the correct interval after restart.
-func (w *WALWriter) rebuildIndex() error {
-	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("wal: seek start: %w", err)
+// recover reconstructs the head offset after a restart. It loads the sparse
+// checkpoints, positions at the last one, and scans forward only over the tail
+// (at most a checkpoint interval of records) to count records up to the head and
+// truncate a torn final record. No CRC is verified here — checkpoints are a
+// speed hint, and integrity is checked on every read instead.
+func (w *WALWriter) recover() error {
+	if err := w.store.LoadCheckpoints(); err != nil {
+		return err
 	}
 
-	lenBuf := make([]byte, LengthSize)
-	crcBuf := make([]byte, CrcSize)
 	var pos int64
-	var recordCount uint32
+	var off uint64
+	if cpOff, cpPos, ok := w.store.Floor(^uint64(0)); ok {
+		off, pos = cpOff, cpPos
+	}
 
+	info, err := w.file.Stat()
+	if err != nil {
+		return fmt.Errorf("wal: stat during recovery: %w", err)
+	}
+	fileSize := info.Size()
+
+	lenBuf := make([]byte, LengthSize)
 	for {
-		_, err := io.ReadFull(w.file, lenBuf)
-		if err == io.EOF {
+		if pos == fileSize {
+			break // clean end, exactly on a record boundary
+		}
+		if pos+RecordHeaderSize > fileSize {
+			// A header started but the file ends before it completes: torn tail.
+			if err := w.file.Truncate(pos); err != nil {
+				return fmt.Errorf("wal: truncate torn header at %d: %w", pos, err)
+			}
 			break
 		}
-		if err == io.ErrUnexpectedEOF {
-			return w.truncateTorn(pos)
-		}
-		if err != nil {
+		if _, err := w.file.ReadAt(lenBuf, pos); err != nil {
 			return fmt.Errorf("wal: read length at %d: %w", pos, err)
 		}
-
 		length := int64(binary.BigEndian.Uint32(lenBuf))
-
 		if length > int64(MaxRecordSize) {
 			return &CorruptionError{
 				Offset: pos,
 				Reason: fmt.Sprintf("length out of bounds: %d", length),
 			}
 		}
-
-		_, err = io.ReadFull(w.file, crcBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return w.truncateTorn(pos)
-		}
-		if err != nil {
-			return fmt.Errorf("wal: read crc at %d: %w", pos, err)
-		}
-		storedCRC := binary.BigEndian.Uint32(crcBuf)
-
-		payload := make([]byte, length)
-		_, err = io.ReadFull(w.file, payload)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return w.truncateTorn(pos)
-		}
-		if err != nil {
-			return fmt.Errorf("wal: read payload at %d: %w", pos, err)
-		}
-
-		computedCRC := crc32.Checksum(lenBuf, w.table)
-		computedCRC = crc32.Update(computedCRC, w.table, payload)
-
-		if computedCRC != storedCRC {
-			return &CorruptionError{
-				Offset:   pos,
-				Expected: storedCRC,
-				Got:      computedCRC,
-				Reason:   "crc mismatch (bit-rot or disk corruption)",
+		recEnd := pos + RecordHeaderSize + length
+		if recEnd > fileSize {
+			// The payload is incomplete: torn tail. Truncate to the last good record.
+			if err := w.file.Truncate(pos); err != nil {
+				return fmt.Errorf("wal: truncate torn payload at %d: %w", pos, err)
 			}
+			break
 		}
-
-		offset := uint64(w.store.Len())
-		w.store.Put(offset, pos)
-		recordCount++
-		pos += RecordHeaderSize + length
+		pos = recEnd
+		off++
 	}
 
-	w.store.ResetCounter(recordCount)
-
-	_, err := w.file.Seek(0, io.SeekEnd)
-	return err
-}
-
-func (w *WALWriter) truncateTorn(validEnd int64) error {
-	if err := w.file.Truncate(validEnd); err != nil {
-		return fmt.Errorf("wal: truncate torn record at %d: %w", validEnd, err)
+	w.nextOffset = off
+	w.size = pos
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("wal: seek end after recovery: %w", err)
 	}
-	_, err := w.file.Seek(0, io.SeekEnd)
-	return err
+	return nil
 }

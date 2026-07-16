@@ -17,8 +17,10 @@ import (
 // shared file cursor. That is what lets many readers run concurrently with a
 // writer that is appending at the end — no lock is held during disk I/O.
 //
-// Offset-to-position lookups go through the InMemoryStore directly (taking
-// only an RLock), so readers never contend with the writer's mutex.
+// Because the index is sparse (only every Nth offset is a checkpoint), a read
+// finds its target by taking the nearest checkpoint at or below the offset
+// (store.Floor) and scanning records forward from there until it reaches the
+// target — at most a checkpoint interval of records.
 type WALReader struct {
 	store  inmemorystore.InMemoryStoreInterface
 	file   *os.File
@@ -27,7 +29,6 @@ type WALReader struct {
 }
 
 // NewWALReader opens a read-only handle to the same log file the writer owns.
-// The store provides offset-to-position lookups without going through the writer.
 func NewWALReader(filename string, store inmemorystore.InMemoryStoreInterface) (*WALReader, error) {
 	file, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
@@ -40,46 +41,61 @@ func NewWALReader(filename string, store inmemorystore.InMemoryStoreInterface) (
 	}, nil
 }
 
-// ReadAt returns the payload stored at the given offset. This is the core
-// primitive: offset -> position -> bytes. It is stateless (doesn't move the
-// cursor) and safe to call from many goroutines at once.
+// ReadAt returns the payload stored at the given offset. It seeks to the nearest
+// checkpoint at/below the offset, then scans records forward to the target. It
+// is stateless (doesn't move a shared cursor) and safe to call concurrently.
 //
-// The CRC32C is recomputed and verified on EVERY read, not just at startup.
-// Bit-rot can strike a record after the engine has booted and indexed it;
-// verifying on read means we never silently hand a consumer corrupt bytes.
+// The CRC32C is recomputed and verified on the target record on EVERY read —
+// bit-rot can strike after the engine has booted, and (because startup no longer
+// full-scans) read time is now the point where corruption is caught. Skipped
+// records on the way to the target are framed by their length only.
 //
-// If the offset has not been written yet it returns io.EOF. A *CorruptionError
-// is returned if the stored CRC does not match the recomputed one.
+// Returns io.EOF if the offset has not been written yet, or a *CorruptionError
+// if the target record's stored CRC does not match.
 func (r *WALReader) ReadAt(offset uint64) ([]byte, error) {
-	pos, ok := r.store.Get(offset)
+	cur, pos, ok := r.store.Floor(offset)
 	if !ok {
-		return nil, io.EOF
+		cur, pos = 0, 0
 	}
 
-	lenBuf := make([]byte, LengthSize+CrcSize)
-	if _, err := r.file.ReadAt(lenBuf, pos); err != nil {
-		return nil, fmt.Errorf("wal: read header at offset %d (pos %d): %w", offset, pos, err)
-	}
-	length := binary.BigEndian.Uint32(lenBuf[:LengthSize])
-	storedCRC := binary.BigEndian.Uint32(lenBuf[LengthSize:])
-
-	payload := make([]byte, length)
-	if _, err := r.file.ReadAt(payload, pos+RecordHeaderSize); err != nil {
-		return nil, fmt.Errorf("wal: read payload at offset %d (pos %d): %w", offset, pos, err)
-	}
-
-	computedCRC := crc32.Checksum(lenBuf[:LengthSize], r.table)
-	computedCRC = crc32.Update(computedCRC, r.table, payload)
-	if computedCRC != storedCRC {
-		return nil, &CorruptionError{
-			Offset:   pos,
-			Expected: storedCRC,
-			Got:      computedCRC,
-			Reason:   fmt.Sprintf("crc mismatch reading offset %d", offset),
+	header := make([]byte, RecordHeaderSize)
+	for {
+		if _, err := r.file.ReadAt(header, pos); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil, io.EOF // scanned past the head: offset not written yet
+			}
+			return nil, fmt.Errorf("wal: read header at offset %d (pos %d): %w", offset, pos, err)
 		}
-	}
+		length := binary.BigEndian.Uint32(header[:LengthSize])
+		if int64(length) > int64(MaxRecordSize) {
+			return nil, &CorruptionError{
+				Offset: pos,
+				Reason: fmt.Sprintf("length out of bounds: %d", length),
+			}
+		}
 
-	return payload, nil
+		if cur == offset {
+			storedCRC := binary.BigEndian.Uint32(header[LengthSize:])
+			payload := make([]byte, length)
+			if _, err := r.file.ReadAt(payload, pos+RecordHeaderSize); err != nil {
+				return nil, fmt.Errorf("wal: read payload at offset %d (pos %d): %w", offset, pos, err)
+			}
+			computedCRC := crc32.Checksum(header[:LengthSize], r.table)
+			computedCRC = crc32.Update(computedCRC, r.table, payload)
+			if computedCRC != storedCRC {
+				return nil, &CorruptionError{
+					Offset:   pos,
+					Expected: storedCRC,
+					Got:      computedCRC,
+					Reason:   fmt.Sprintf("crc mismatch reading offset %d", offset),
+				}
+			}
+			return payload, nil
+		}
+
+		pos += RecordHeaderSize + int64(length)
+		cur++
+	}
 }
 
 // Read returns the record at the cursor, then advances the cursor by one.

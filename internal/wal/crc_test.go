@@ -23,10 +23,16 @@ func writeRecords(t *testing.T, path string, payloads ...string) {
 	store.Close()
 }
 
-func TestCRCDetectsBitRot(t *testing.T) {
+// TestCRCDetectsBitRotOnRead verifies the post-checkpoint-recovery guarantee:
+// startup no longer full-scans the WAL (it trusts the sparse checkpoints), so
+// bit-rot in a complete record is caught on READ rather than at reopen. The
+// reopen itself succeeds; the corruption surfaces when the record is read.
+func TestCRCDetectsBitRotOnRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.log")
 	writeRecords(t, path, "hello", "world", "third")
 
+	// Corrupt a byte inside the third record (offset 2). Each record is 13 bytes
+	// (8 header + 5 payload); record 2 begins at byte 26, so byte 30 lands in it.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -47,15 +53,24 @@ func TestCRCDetectsBitRot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	_, err = NewWalWriter(path, store)
-	if err == nil {
-		t.Fatal("expected corruption to be detected on reopen, got nil error")
+
+	// Reopen now succeeds — recovery no longer verifies CRCs.
+	if _, err := NewWalWriter(path, store); err != nil {
+		t.Fatalf("reopen should succeed (recovery does not CRC-scan), got: %v", err)
 	}
+
+	r, err := NewWALReader(path, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	_, err = r.ReadAt(2)
 	var ce *CorruptionError
 	if !errors.As(err, &ce) {
-		t.Fatalf("expected *CorruptionError, got %T: %v", err, err)
+		t.Fatalf("expected *CorruptionError reading corrupted offset 2, got %T: %v", err, err)
 	}
-	t.Logf("correctly detected corruption: %v", ce)
+	t.Logf("correctly detected corruption on read: %v", ce)
 }
 
 func TestTornTailIsTruncatedNotCorruption(t *testing.T) {
