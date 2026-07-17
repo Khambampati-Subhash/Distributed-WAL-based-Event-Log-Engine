@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 )
 
@@ -55,11 +56,11 @@ func TestCRCDetectsBitRotOnRead(t *testing.T) {
 	defer store.Close()
 
 	// Reopen now succeeds — recovery no longer verifies CRCs.
-	if _, err := NewWalWriter(path, store); err != nil {
+	if _, err := NewWalWriter(path, store, testChecksum()); err != nil {
 		t.Fatalf("reopen should succeed (recovery does not CRC-scan), got: %v", err)
 	}
 
-	r, err := NewWALReader(path, store)
+	r, err := NewWALReader(path, store, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestCRCMatchesOnCleanRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := NewWALReader(path, store)
+	r, err := NewWALReader(path, store, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +114,72 @@ func TestCRCMatchesOnCleanRoundTrip(t *testing.T) {
 	}
 	if string(data) != "payload-with-crc" {
 		t.Fatalf("got %q", data)
+	}
+}
+
+// TestSwappableChecksumSHA256 proves the checksum is decoupled: the WAL works
+// unchanged with SHA-256 (a 32-byte header instead of CRC32C's 4), and still
+// round-trips, recovers, and detects corruption — all via the Checksum interface.
+func TestSwappableChecksumSHA256(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.log")
+	idxPath := path + ".index"
+	sha := checksum.NewSHA256()
+
+	store, err := inmemorystore.NewInMemoryStore(idxPath, NthIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWalWriter(path, store, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"alpha", "beta", "gamma"} {
+		if _, err := w.Write([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+	store.Close()
+
+	// Reopen with SHA-256 and read back — recovery must parse the 32-byte header.
+	store2, err := inmemorystore.NewInMemoryStore(idxPath, NthIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	w2, err := NewWalWriter(path, store2, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if got := w2.NextOffset(); got != 3 {
+		t.Fatalf("recovered NextOffset = %d, want 3", got)
+	}
+
+	r, err := NewWALReader(path, store2, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got, err := r.ReadAt(1)
+	if err != nil {
+		t.Fatalf("SHA-256 read should succeed, got: %v", err)
+	}
+	if string(got) != "beta" {
+		t.Fatalf("read %q, want %q", got, "beta")
+	}
+
+	// Corrupt a payload byte and confirm the SHA-256 checksum catches it on read.
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	// Record 0 begins at 0; its payload starts after a 4+32 = 36-byte header.
+	var b [1]byte
+	f.ReadAt(b[:], 37)
+	b[0] ^= 0xFF
+	f.WriteAt(b[:], 37)
+	f.Close()
+
+	if _, err := r.ReadAt(0); err == nil {
+		t.Fatal("expected SHA-256 to detect the corrupted record on read")
 	}
 }
 
@@ -132,7 +199,7 @@ func TestReadAtDetectsRuntimeCorruption(t *testing.T) {
 	f.WriteAt(b[:], 10)
 	f.Close()
 
-	r, err := NewWALReader(path, store)
+	r, err := NewWALReader(path, store, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}

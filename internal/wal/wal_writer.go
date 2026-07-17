@@ -3,44 +3,46 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 )
 
 // On-disk record format (repeated, append-only):
 //
-//	[ length : 4-byte big-endian uint32 ]
-//	[ crc    : 4-byte big-endian CRC32C of (length || payload) ]
-//	[ payload : <length> bytes ]
+//	[ length   : 4-byte big-endian uint32 ]
+//	[ checksum : Checksum.Size() bytes over (length || payload) ]
+//	[ payload  : <length> bytes ]
+//
+// The checksum width is not fixed here: it comes from the pluggable
+// checksum.Checksum, so LengthSize is the only constant part of the header.
 const (
-	LengthSize       = 4
-	CrcSize          = 4
-	RecordHeaderSize = LengthSize + CrcSize
-	MaxRecordSize    = 64 * 1024 * 1024 // 64MB sanity cap
-	NthIndex         = 10
+	LengthSize    = 4
+	MaxRecordSize = 64 * 1024 * 1024 // 64MB sanity cap
+	NthIndex      = 10
 )
 
 // CorruptionError indicates detected bit-rot or corruption in the log.
 type CorruptionError struct {
 	Offset   int64  // byte position in file
-	Expected uint32 // expected CRC
-	Got      uint32 // actual CRC computed from bytes
+	Expected []byte // checksum stored on disk
+	Got      []byte // checksum recomputed from the bytes
 	Reason   string
 }
 
 func (e *CorruptionError) Error() string {
-	return fmt.Sprintf("wal: corruption at byte %d: %s (crc: expected %08x, got %08x)", e.Offset, e.Reason, e.Expected, e.Got)
+	return fmt.Sprintf("wal: corruption at byte %d: %s (checksum: expected %x, got %x)", e.Offset, e.Reason, e.Expected, e.Got)
 }
 
 type WALWriter struct {
 	mu         sync.Mutex
 	file       *os.File
-	table      *crc32.Table
+	csum       checksum.Checksum
+	headerSize int // LengthSize + csum.Size()
 	size       int64
 	nextOffset uint64 // offset the next Write will assign
 	store      inmemorystore.InMemoryStoreInterface
@@ -49,8 +51,9 @@ type WALWriter struct {
 // NewWalWriter opens (or creates) the log file and recovers its head offset from
 // the sparse checkpoint index rather than a full scan: it loads the checkpoints,
 // jumps to the last one, and scans only the short tail after it to find the true
-// head and truncate any torn final record. The caller provides the store.
-func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface) (*WALWriter, error) {
+// head and truncate any torn final record. The caller provides the store and the
+// checksum algorithm (which fixes the on-disk header width for this log).
+func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface, csum checksum.Checksum) (*WALWriter, error) {
 	_, statErr := os.Stat(filename)
 	isNew := os.IsNotExist(statErr)
 
@@ -67,9 +70,10 @@ func NewWalWriter(filename string, store inmemorystore.InMemoryStoreInterface) (
 	}
 
 	w := &WALWriter{
-		file:  file,
-		table: crc32.MakeTable(crc32.Castagnoli),
-		store: store,
+		file:       file,
+		csum:       csum,
+		headerSize: LengthSize + csum.Size(),
+		store:      store,
 	}
 	if err := w.recover(); err != nil {
 		file.Close()
@@ -104,15 +108,11 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 	var lenBuf [LengthSize]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 
-	crcChecksum := crc32.Checksum(lenBuf[:], w.table)
-	crcChecksum = crc32.Update(crcChecksum, w.table, data)
+	sum := w.csum.Compute(lenBuf[:], data) // checksum over length || payload
 
-	var crcBuf [CrcSize]byte
-	binary.BigEndian.PutUint32(crcBuf[:], crcChecksum)
-
-	buf := make([]byte, 0, RecordHeaderSize+len(data))
+	buf := make([]byte, 0, w.headerSize+len(data))
 	buf = append(buf, lenBuf[:]...)
-	buf = append(buf, crcBuf[:]...)
+	buf = append(buf, sum...)
 	buf = append(buf, data...)
 
 	if _, err := w.file.Write(buf); err != nil {
@@ -128,7 +128,7 @@ func (w *WALWriter) Write(data []byte) (uint64, error) {
 		return 0, err
 	}
 	w.nextOffset++
-	w.size += RecordHeaderSize + int64(len(data))
+	w.size += int64(w.headerSize) + int64(len(data))
 	return offset, nil
 }
 
@@ -181,7 +181,7 @@ func (w *WALWriter) recover() error {
 		if pos == fileSize {
 			break // clean end, exactly on a record boundary
 		}
-		if pos+RecordHeaderSize > fileSize {
+		if pos+int64(w.headerSize) > fileSize {
 			// A header started but the file ends before it completes: torn tail.
 			if err := w.file.Truncate(pos); err != nil {
 				return fmt.Errorf("wal: truncate torn header at %d: %w", pos, err)
@@ -198,7 +198,7 @@ func (w *WALWriter) recover() error {
 				Reason: fmt.Sprintf("length out of bounds: %d", length),
 			}
 		}
-		recEnd := pos + RecordHeaderSize + length
+		recEnd := pos + int64(w.headerSize) + length
 		if recEnd > fileSize {
 			// The payload is incomplete: torn tail. Truncate to the last good record.
 			if err := w.file.Truncate(pos); err != nil {

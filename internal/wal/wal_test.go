@@ -8,8 +8,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 )
+
+// testChecksum is the algorithm used across the WAL tests unless a test needs a
+// specific one; a fresh CRC32C instance matches the production default.
+func testChecksum() checksum.Checksum { return checksum.NewCRC32C() }
 
 func newTestWriter(t *testing.T, path string) (*WALWriter, *inmemorystore.InMemoryStore) {
 	t.Helper()
@@ -23,7 +28,7 @@ func newTestWriterNth(t *testing.T, path string, nth uint32) (*WALWriter, *inmem
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := NewWalWriter(path, store)
+	w, err := NewWalWriter(path, store, testChecksum())
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -58,7 +63,7 @@ func TestCheckpointRecoveryAndForwardScan(t *testing.T) {
 		t.Fatalf("recovered NextOffset = %d, want %d", got, n)
 	}
 
-	r, err := NewWALReader(path, store2)
+	r, err := NewWALReader(path, store2, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +101,7 @@ func TestWriteReadRecover(t *testing.T) {
 		t.Fatalf("offsets should be 0,1 got %d,%d", o0, o1)
 	}
 
-	r, err := NewWALReader(path, store)
+	r, err := NewWALReader(path, store, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +172,7 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 		readWg.Add(1)
 		go func(rid int) {
 			defer readWg.Done()
-			reader, err := NewWALReader(path, store)
+			reader, err := NewWALReader(path, store, testChecksum())
 			if err != nil {
 				t.Errorf("reader %d open: %v", rid, err)
 				return
@@ -209,7 +214,7 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 		seen[off] = true
 	}
 
-	r, err := NewWALReader(path, store)
+	r, err := NewWALReader(path, store, testChecksum())
 	if err != nil {
 		t.Fatal(err)
 	}

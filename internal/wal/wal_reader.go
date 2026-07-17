@@ -1,12 +1,13 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 )
 
@@ -22,22 +23,26 @@ import (
 // (store.Floor) and scanning records forward from there until it reaches the
 // target — at most a checkpoint interval of records.
 type WALReader struct {
-	store  inmemorystore.InMemoryStoreInterface
-	file   *os.File
-	offset uint64
-	table  *crc32.Table
+	store      inmemorystore.InMemoryStoreInterface
+	file       *os.File
+	offset     uint64
+	csum       checksum.Checksum
+	headerSize int // LengthSize + csum.Size()
 }
 
 // NewWALReader opens a read-only handle to the same log file the writer owns.
-func NewWALReader(filename string, store inmemorystore.InMemoryStoreInterface) (*WALReader, error) {
+// It must be given the SAME checksum algorithm the writer used, since that fixes
+// the header width the reader parses.
+func NewWALReader(filename string, store inmemorystore.InMemoryStoreInterface, csum checksum.Checksum) (*WALReader, error) {
 	file, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open for read %q: %w", filename, err)
 	}
 	return &WALReader{
-		store: store,
-		file:  file,
-		table: crc32.MakeTable(crc32.Castagnoli),
+		store:      store,
+		file:       file,
+		csum:       csum,
+		headerSize: LengthSize + csum.Size(),
 	}, nil
 }
 
@@ -58,7 +63,7 @@ func (r *WALReader) ReadAt(offset uint64) ([]byte, error) {
 		cur, pos = 0, 0
 	}
 
-	header := make([]byte, RecordHeaderSize)
+	header := make([]byte, r.headerSize)
 	for {
 		if _, err := r.file.ReadAt(header, pos); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -75,25 +80,24 @@ func (r *WALReader) ReadAt(offset uint64) ([]byte, error) {
 		}
 
 		if cur == offset {
-			storedCRC := binary.BigEndian.Uint32(header[LengthSize:])
+			storedSum := header[LengthSize:]
 			payload := make([]byte, length)
-			if _, err := r.file.ReadAt(payload, pos+RecordHeaderSize); err != nil {
+			if _, err := r.file.ReadAt(payload, pos+int64(r.headerSize)); err != nil {
 				return nil, fmt.Errorf("wal: read payload at offset %d (pos %d): %w", offset, pos, err)
 			}
-			computedCRC := crc32.Checksum(header[:LengthSize], r.table)
-			computedCRC = crc32.Update(computedCRC, r.table, payload)
-			if computedCRC != storedCRC {
+			computedSum := r.csum.Compute(header[:LengthSize], payload)
+			if !bytes.Equal(computedSum, storedSum) {
 				return nil, &CorruptionError{
 					Offset:   pos,
-					Expected: storedCRC,
-					Got:      computedCRC,
-					Reason:   fmt.Sprintf("crc mismatch reading offset %d", offset),
+					Expected: append([]byte(nil), storedSum...),
+					Got:      computedSum,
+					Reason:   fmt.Sprintf("checksum mismatch reading offset %d", offset),
 				}
 			}
 			return payload, nil
 		}
 
-		pos += RecordHeaderSize + int64(length)
+		pos += int64(r.headerSize) + int64(length)
 		cur++
 	}
 }

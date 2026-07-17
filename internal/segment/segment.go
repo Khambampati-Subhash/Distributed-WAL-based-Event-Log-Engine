@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/inmemorystore"
 	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/wal"
 )
@@ -59,8 +60,10 @@ func indexFileName(logPath string) string {
 }
 
 // NewSegment opens (or creates) the segment file for baseOffset inside dir,
-// recovering its index from disk via the underlying WALWriter.
-func NewSegment(dir string, baseOffset uint64) (*Segment, error) {
+// recovering its index from disk via the underlying WALWriter. The checksum
+// algorithm is shared by the writer and reader and fixes this segment's on-disk
+// record-header width.
+func NewSegment(dir string, baseOffset uint64, csum checksum.Checksum) (*Segment, error) {
 	path := filepath.Join(dir, SegmentFileName(baseOffset))
 	idxPath := indexFileName(path)
 
@@ -69,12 +72,12 @@ func NewSegment(dir string, baseOffset uint64) (*Segment, error) {
 		return nil, err
 	}
 
-	writer, err := wal.NewWalWriter(path, store)
+	writer, err := wal.NewWalWriter(path, store, csum)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
-	reader, err := wal.NewWALReader(path, store)
+	reader, err := wal.NewWALReader(path, store, csum)
 	if err != nil {
 		writer.Close()
 		store.Close()

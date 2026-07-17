@@ -51,10 +51,13 @@ file** — the file is pure appended records.
  └──── CRC covers (len ‖ payload) ────┘
 ```
 
-To read a record: read the 4-byte length `N`, read the 4-byte CRC, then read the
-next `N` payload bytes and verify the CRC. `len` and `crc` are big-endian
-`uint32`. The engine never looks inside the payload — it stores and returns
-**opaque bytes**. See [Integrity (CRC32C)](#integrity-crc32c) for why and how.
+To read a record: read the 4-byte length `N`, read the checksum, then read the
+next `N` payload bytes and verify the checksum. `len` is a big-endian `uint32`.
+The checksum shown is CRC32C (4 bytes, the default) — its **width depends on the
+algorithm** (SHA-256 would make it 32 bytes; see
+[the pluggable checksum](#the-checksum-algorithm-is-pluggable-strategy-pattern)).
+The engine never looks inside the payload — it stores and returns **opaque
+bytes**. See [Integrity (CRC32C)](#integrity-crc32c) for why and how.
 
 ### Index: sparse checkpoints, not a full map
 
@@ -524,6 +527,39 @@ Kafka does — it does not re-verify the whole log on every restart either.)
 > Phase-1 log file cannot be read by Phase-2 and vice versa. For this tagged
 > learning project that's intentional — start each phase with a fresh log.
 
+### The checksum algorithm is pluggable (Strategy pattern)
+
+The WAL does not depend on `crc32` directly — it depends on a small `Checksum`
+interface, so the algorithm is chosen by construction and swapping it touches
+**no WAL code**:
+
+```go
+type Checksum interface {
+    Compute(parts ...[]byte) []byte // checksum of the parts, concatenated
+    Size() int                      // width in bytes (4 for CRC32C, 32 for SHA-256)
+    Name() string
+}
+```
+
+Two implementations ship: `checksum.CRC32C` (default — fast, hardware-accelerated,
+for random disk faults) and `checksum.SHA256` (cryptographic — for tamper
+detection, at higher cost). Select one when opening the log:
+
+```go
+m, _ := segment.Open(segment.Config{
+    Dir:      "mylog",
+    Checksum: checksum.NewSHA256(), // omit for the CRC32C default
+})
+```
+
+> **The checksum width is part of the on-disk format.** The record header is
+> `[length][checksum]`, and the checksum is `Size()` bytes — 4 for CRC32C, 32 for
+> SHA-256. So the algorithm is **fixed per log**: a CRC log cannot be read by a
+> SHA-256 reader. Pick one per log directory (a future enhancement could stamp
+> the algorithm in a file header to make logs self-describing). Adding a third
+> algorithm is just a new `Checksum` implementation — the WAL, segments, and
+> networking are untouched.
+
 ---
 
 ## Concurrency model
@@ -585,7 +621,8 @@ read in parallel without blocking the writer.
 
 | Package | Responsibility |
 |---------|----------------|
-| `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), CRC32C, recovery. |
+| `internal/wal` | Per-file primitive: durable append (`WALWriter`) + positional read (`WALReader`), checksum, recovery. |
+| `internal/checksum` | Pluggable integrity algorithm (`Checksum` interface): `CRC32C` (default) or `SHA256`, swappable by construction. |
 | `internal/inmemorystore` | In-memory offset-to-position map + sparse on-disk `.index` file management. |
 | `internal/segment` | Splits the log into base-offset segment files; `Manager` routes append/read + rolls, `Reader` is a cross-segment cursor. |
 | `internal/protocol` | The length-prefixed binary wire format — the single source of truth shared by server and client. Engine-free. |
@@ -744,7 +781,9 @@ internal/
   wal/wal_writer.go                          # per-file durable append + CRC + recovery
   wal/wal_reader.go                          # per-file positional reads by offset
   wal/wal_test.go                            # WAL unit + concurrency tests
-  wal/crc_test.go                            # CRC detection + torn tail tests
+  wal/crc_test.go                            # checksum detection + torn tail + SHA-256 swap tests
+  checksum/checksum.go                       # Checksum interface + CRC32C and SHA256 implementations
+  checksum/checksum_test.go                  # shared algorithm-contract tests
   inmemorystore/store.go                     # in-memory index map + sparse .index file
   inmemorystore/interface.go                 # InMemoryStoreInterface definition
   segment/segment.go                         # one segment = WALWriter + base offset + refcount

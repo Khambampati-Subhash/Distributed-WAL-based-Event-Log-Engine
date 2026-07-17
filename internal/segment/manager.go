@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Khambampati-Subhash/Distributed-WAL-based-Event-Log-Engine/internal/checksum"
 )
 
 // Defaults applied when Config leaves a field unset.
@@ -32,6 +34,11 @@ type Config struct {
 	CheckInterval    time.Duration // how often the retention goroutine runs
 	MaxDeletesPerRun int           // cap deletes per run (0 = unlimited) to smooth I/O
 	DisableRetention bool          // if true, no background retention goroutine starts
+
+	// Checksum is the integrity algorithm for every segment in this log. It fixes
+	// the on-disk record-header width, so it must stay consistent for a given log
+	// directory. Nil defaults to CRC32C.
+	Checksum checksum.Checksum
 
 	// clock is injectable for deterministic tests; nil means time.Now.
 	clock func() time.Time
@@ -116,6 +123,9 @@ func Open(cfg Config) (*Manager, error) {
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = DefaultCheckInterval
 	}
+	if cfg.Checksum == nil {
+		cfg.Checksum = checksum.NewCRC32C()
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("segment: mkdir %q: %w", cfg.Dir, err)
 	}
@@ -129,7 +139,7 @@ func Open(cfg Config) (*Manager, error) {
 
 	if len(bases) == 0 {
 		// Fresh log: one empty segment starting at offset 0.
-		seg, err := NewSegment(cfg.Dir, 0)
+		seg, err := NewSegment(cfg.Dir, 0, cfg.Checksum)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +148,7 @@ func Open(cfg Config) (*Manager, error) {
 		// Reopen every existing segment in base-offset order; each rebuilds its
 		// own index from disk. The last one (highest base) becomes active.
 		for _, base := range bases {
-			seg, err := NewSegment(cfg.Dir, base)
+			seg, err := NewSegment(cfg.Dir, base, cfg.Checksum)
 			if err != nil {
 				m.closeAll()
 				return nil, err
@@ -204,7 +214,7 @@ func (m *Manager) Append(data []byte) (uint64, error) {
 // next global offset. Caller holds mu.
 func (m *Manager) roll() error {
 	nextBase := m.active().NextOffset()
-	seg, err := NewSegment(m.cfg.Dir, nextBase)
+	seg, err := NewSegment(m.cfg.Dir, nextBase, m.cfg.Checksum)
 	if err != nil {
 		return fmt.Errorf("segment: roll to base %d: %w", nextBase, err)
 	}
