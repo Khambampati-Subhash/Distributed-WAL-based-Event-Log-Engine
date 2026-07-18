@@ -1,6 +1,7 @@
 package inmemorystore
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,6 +101,59 @@ func TestCheckpointsPersistAndReload(t *testing.T) {
 	off, pos, ok := s2.Floor(100)
 	if !ok || off != 5 || pos != 50 {
 		t.Fatalf("after reload, Floor(100) = (%d,%d,%v), want (5,50,true)", off, pos, ok)
+	}
+}
+
+// TestNonMonotonicIndexTruncated covers the edge case where — because the index
+// is written without its own fsync — a crash could leave a partially-flushed or
+// garbage entry in the middle. LoadCheckpoints must keep only the valid strictly
+// ascending prefix and self-heal the file, so Floor never returns a bogus entry.
+func TestNonMonotonicIndexTruncated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seg.index")
+
+	// Hand-write three entries; the third goes BACKWARDS in offset (corruption).
+	entries := []struct {
+		off uint64
+		pos int64
+	}{
+		{10, 100},
+		{20, 200},
+		{15, 150}, // non-monotonic: must be discarded along with anything after
+	}
+	var raw []byte
+	for _, e := range entries {
+		var b [indexEntryBytes]byte
+		binary.BigEndian.PutUint64(b[0:8], e.off)
+		binary.BigEndian.PutUint64(b[8:16], uint64(e.pos))
+		raw = append(raw, b[:]...)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := NewInMemoryStore(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.LoadCheckpoints(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s.offsets) != 2 {
+		t.Fatalf("expected valid prefix of 2 checkpoints, got %d (%v)", len(s.offsets), s.offsets)
+	}
+	off, pos, ok := s.Floor(1000)
+	if !ok || off != 20 || pos != 200 {
+		t.Fatalf("Floor(1000) = (%d,%d,%v), want (20,200,true)", off, pos, ok)
+	}
+	// The file must be self-healed to exactly the valid prefix.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 2*indexEntryBytes {
+		t.Fatalf("index file size %d, want %d after self-heal", info.Size(), 2*indexEntryBytes)
 	}
 }
 

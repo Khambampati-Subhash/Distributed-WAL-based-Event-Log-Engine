@@ -197,17 +197,35 @@ func (m *Manager) active() *Segment {
 // Append writes one opaque record to the active segment and returns its global
 // offset, rolling to a new segment first if the active one is full.
 func (m *Manager) Append(data []byte) (uint64, error) {
+	// Phase 1 (under the manager lock): pick/roll the active segment and reserve
+	// this record's offset. This is fast — no fsync — so producers serialize only
+	// briefly here.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	// Roll BEFORE writing if the active segment is already at/over the limit.
 	// (Rolling before, not after, keeps each segment <= MaxSegmentBytes + one record.)
 	if m.active().Size() >= m.cfg.MaxSegmentBytes {
 		if err := m.roll(); err != nil {
+			m.mu.Unlock()
 			return 0, err
 		}
 	}
-	return m.active().Append(data, m.cfg.now())
+	seg := m.active()
+	localOffset, seq, err := seg.reserve(data, m.cfg.now())
+	if err != nil {
+		m.mu.Unlock()
+		return 0, err
+	}
+	base := seg.BaseOffset()
+	m.mu.Unlock()
+
+	// Phase 2 (NO manager lock): the slow fsync. Releasing the lock here is what
+	// lets concurrent appends reach the WAL together and share one fsync (group
+	// commit). seg stays valid: it was just written, so retention (which only
+	// deletes aged, non-active segments) cannot remove it from under us.
+	if err := seg.commit(seq); err != nil {
+		return 0, err
+	}
+	return base + localOffset, nil
 }
 
 // roll seals the active segment and starts a new one whose base offset is the

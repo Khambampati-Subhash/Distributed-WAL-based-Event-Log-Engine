@@ -114,15 +114,33 @@ func (s *Segment) Contains(globalOffset uint64) bool {
 }
 
 func (s *Segment) Append(data []byte, now time.Time) (uint64, error) {
-	localSlot, err := s.writer.Write(data)
+	localSlot, seq, err := s.reserve(data, now)
 	if err != nil {
 		return 0, err
+	}
+	if err := s.writer.Commit(seq); err != nil {
+		return 0, err
+	}
+	return s.baseOffset + localSlot, nil
+}
+
+// reserve is phase 1 of an append: assign the local offset (fast, no fsync). The
+// caller commits phase 2 with the returned seq. Splitting the two lets the
+// Manager release its lock before the slow fsync, so concurrent appends can be
+// group-committed by the underlying WAL.
+func (s *Segment) reserve(data []byte, now time.Time) (localOffset, seq uint64, err error) {
+	localOffset, seq, err = s.writer.Reserve(data)
+	if err != nil {
+		return 0, 0, err
 	}
 	s.mu.Lock()
 	s.lastAppend = now
 	s.mu.Unlock()
-	return s.baseOffset + localSlot, nil
+	return localOffset, seq, nil
 }
+
+// commit is phase 2 of an append: make the reserved record durable.
+func (s *Segment) commit(seq uint64) error { return s.writer.Commit(seq) }
 
 func (s *Segment) LastAppend() time.Time {
 	s.mu.Lock()

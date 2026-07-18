@@ -10,3 +10,7 @@
 # Local log/data files produced at runtime
 *.log
 /data/
+
+# Benchmark dashboard output
+benchmark-report.html
+*.html
