@@ -725,6 +725,119 @@ findings. Core packages sit around 75–82% statement coverage.
 
 ---
 
+## Benchmarks
+
+`cmd/benchmark` is a load generator + comparison dashboard. It exists to answer
+two questions: **how much does the checksum algorithm cost**, and **how much does
+fsync batching (group commit) help throughput**. See
+[`DURABILITY_AND_FSYNC.md`](DURABILITY_AND_FSYNC.md) for the full reasoning.
+
+### What it measures
+
+It runs **two phases per checksum algorithm** (CRC32C and SHA-256):
+
+1. **Pure checksum microbenchmark** — computes millions of checksums directly to
+   isolate raw cost: **ns/op, MB/s, allocations/op**. This is where the algorithm
+   difference is visible (fsync isn't involved).
+2. **End-to-end load** — **3 producers** append while **2 consumers** read and
+   "process" (an optional per-message sleep). Every record embeds its produce
+   timestamp so consumers measure true end-to-end latency. It reports **produce
+   throughput, produce/consume latency p50/p95/p99, and memory** (peak heap +
+   total allocations, sampled during the run).
+
+Producers and consumers are goroutines against one in-process `segment.Manager`
+(no network) so the numbers reflect the engine, not TCP overhead. Output is a
+self-contained **HTML dashboard**.
+
+### How to run it
+
+```bash
+# Default: 50k messages, 3 producers, 2 consumers, 128B payload, CRC32C vs SHA-256
+go run ./cmd/benchmark
+
+# Show group commit scaling — the win grows with producer concurrency
+go run ./cmd/benchmark -messages 30000 -producers 3  -out low-concurrency.html
+go run ./cmd/benchmark -messages 30000 -producers 50 -out high-concurrency.html
+
+# Simulate slow consumers (watch end-to-end latency climb as backlog builds)
+go run ./cmd/benchmark -messages 20000 -consumer-sleep 1ms
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-messages` | `50000` | total messages produced (raise for a heavier run) |
+| `-producers` | `3` | producer goroutines |
+| `-consumers` | `2` | consumer goroutines (each reads the whole log) |
+| `-payload` | `128` | payload bytes (min 8; larger favors CRC over SHA even more) |
+| `-consumer-sleep` | `0` | sleep per consumed message (simulate processing) |
+| `-micro-iters` | `2000000` | iterations for the pure checksum phase |
+| `-out` | `benchmark-report.html` | dashboard output path |
+
+> **Expect it to be slow at high `-messages`:** each durable append still ends in
+> an fsync (group-committed, but real), so "millions" of messages take minutes.
+> Start small and scale up.
+
+### Results on the reference machine
+
+Environment these numbers were captured on:
+
+| | |
+|---|---|
+| **Machine** | Apple M4 Max, 16 cores, 48 GB RAM |
+| **OS** | macOS (Darwin 24.6.0), arm64 |
+| **Go** | 1.25.0, `GOMAXPROCS=16` |
+| **fsync** | `File.Sync()` → `F_FULLFSYNC` (honest flush to the drive); ~5–13 ms observed |
+| **Workload** | 30 000 messages, 128 B payload, `-consumer-sleep 0` |
+
+**Group commit throughput** (CRC32C), before = per-event fsync:
+
+| Producers | Before (per-event fsync) | After (group commit) | Speedup |
+|-----------|-------------------------:|---------------------:|--------:|
+| 3 | ~206 msg/s | **471 msg/s** | 2.3× |
+| 50 | ~206 msg/s | **4 974 msg/s** | **~24×** |
+
+Per-event fsync serializes on the write lock, so more producers don't help it.
+Group commit lets concurrent producers share one fsync, so the win grows with
+concurrency.
+
+**Checksum comparison** — invisible under fsync, then visible once batched:
+
+| Producers | CRC32C | SHA-256 |
+|-----------|-------:|--------:|
+| 3 | 471 msg/s | 458 msg/s (≈ same) |
+| 50 | **4 974 msg/s** | **3 395 msg/s** (~30% slower) |
+
+At low throughput fsync dwarfs the checksum, so CRC and SHA-256 tie. Once group
+commit amortizes the fsync, SHA-256's higher CPU cost surfaces as ~30% less
+throughput — a good reminder to benchmark **end-to-end and in isolation**, since
+a cost hidden by one bottleneck can dominate once you remove it.
+
+> **These are machine-specific** and dominated by this drive's fsync latency. Run
+> it on your own hardware — the *shape* (group commit scales with concurrency;
+> CRC beats SHA once fsync is amortized) holds; the absolute numbers will differ.
+
+### Go micro-benchmarks
+
+The raw checksum cost also has standard `go test` benchmarks:
+
+```bash
+go test -bench=. -benchmem ./internal/checksum/
+```
+
+On the reference machine (Apple M4 Max):
+
+```
+BenchmarkCRC32C_128B-16    27.97 ns/op    4719 MB/s    2 allocs/op
+BenchmarkSHA256_128B-16    96.40 ns/op    1369 MB/s    2 allocs/op   (~3.4x slower)
+BenchmarkCRC32C_4KB-16     377.8 ns/op   10852 MB/s    2 allocs/op
+BenchmarkSHA256_4KB-16      1366 ns/op    3002 MB/s    2 allocs/op   (~3.6x slower)
+```
+
+This is the isolated cost that the end-to-end dashboard hides behind fsync at low
+concurrency and reveals at high concurrency.
+
+---
+
 ## Production readiness & limitations
 
 This is a **learning project built phase by phase**, and it is honest about
@@ -775,6 +888,8 @@ cmd/main.go                                  # single-flow demo
 cmd/concurrent/main.go                       # multi-producer/consumer + lag metrics
 cmd/retention/main.go                        # retention demo + loud reset
 cmd/server/main.go                           # standalone TCP server
+cmd/benchmark/main.go                        # load generator (producers/consumers, latency + memory)
+cmd/benchmark/report.go                      # self-contained HTML dashboard renderer
 cmd/client/main.go                           # TCP client: produce + streaming consume
 client/client.go                             # PUBLIC remote client library (the only importable package)
 internal/
@@ -784,6 +899,7 @@ internal/
   wal/crc_test.go                            # checksum detection + torn tail + SHA-256 swap tests
   checksum/checksum.go                       # Checksum interface + CRC32C and SHA256 implementations
   checksum/checksum_test.go                  # shared algorithm-contract tests
+  checksum/checksum_bench_test.go            # go test -bench cost of CRC32C vs SHA256
   inmemorystore/store.go                     # in-memory index map + sparse .index file
   inmemorystore/interface.go                 # InMemoryStoreInterface definition
   segment/segment.go                         # one segment = WALWriter + base offset + refcount
