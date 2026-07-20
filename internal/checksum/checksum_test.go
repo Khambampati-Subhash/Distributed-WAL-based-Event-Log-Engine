@@ -8,7 +8,16 @@ import (
 // algorithms under test; add new implementations here to get the shared contract
 // checks for free.
 func algorithms() []Checksum {
-	return []Checksum{NewCRC32C(), NewSHA256()}
+	return []Checksum{
+		NewCRC32C(),
+		NewCRC32IEEE(),
+		NewAdler32(),
+		NewCRC64ECMA(),
+		NewFNV1a64(),
+		NewMD5(),
+		NewSHA1(),
+		NewSHA256(),
+	}
 }
 
 func TestSizeMatchesOutput(t *testing.T) {
@@ -53,10 +62,34 @@ func TestDetectsChange(t *testing.T) {
 }
 
 func TestKnownSizes(t *testing.T) {
-	if NewCRC32C().Size() != 4 {
-		t.Errorf("CRC32C size should be 4, got %d", NewCRC32C().Size())
+	cases := []struct {
+		c    Checksum
+		size int
+	}{
+		{NewCRC32C(), 4},
+		{NewCRC32IEEE(), 4},
+		{NewAdler32(), 4},
+		{NewCRC64ECMA(), 8},
+		{NewFNV1a64(), 8},
+		{NewMD5(), 16},
+		{NewSHA1(), 20},
+		{NewSHA256(), 32},
 	}
-	if NewSHA256().Size() != 32 {
-		t.Errorf("SHA256 size should be 32, got %d", NewSHA256().Size())
+	for _, tc := range cases {
+		if tc.c.Size() != tc.size {
+			t.Errorf("%s size = %d, want %d", tc.c.Name(), tc.c.Size(), tc.size)
+		}
+	}
+}
+
+// TestUniqueNames guards against copy-paste mistakes: every algorithm must have a
+// distinct Name (the dashboards and reports key off it).
+func TestUniqueNames(t *testing.T) {
+	seen := map[string]bool{}
+	for _, a := range algorithms() {
+		if seen[a.Name()] {
+			t.Errorf("duplicate algorithm name %q", a.Name())
+		}
+		seen[a.Name()] = true
 	}
 }

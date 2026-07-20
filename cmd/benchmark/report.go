@@ -100,10 +100,16 @@ func chart(b *strings.Builder, title string, results []result, val func(result) 
 		if max > 0 {
 			pct = 2 + 98*v/max
 		}
-		fmt.Fprintf(b, `<div class="barrow"><span class="blabel">%s</span><div class="btrack"><div class="bfill c%d" style="width:%.1f%%"></div></div><span class="bval">%s</span></div>`,
-			r.name, i, pct, fmtVal(v))
+		fmt.Fprintf(b, `<div class="barrow"><span class="blabel">%s</span><div class="btrack"><div class="bfill" style="width:%.1f%%;background:%s"></div></div><span class="bval">%s</span></div>`,
+			r.name, pct, barColor(i), fmtVal(v))
 	}
 	b.WriteString(`</div>`)
+}
+
+// barColor spreads algorithm bars around the hue wheel so any number of them
+// stays visually distinct (the palette used to be two hardcoded CSS classes).
+func barColor(i int) string {
+	return fmt.Sprintf("hsl(%d 65%% 55%%)", (i*40+210)%360)
 }
 
 func row(b *strings.Builder, label string, results []result, cell func(result) string) {

@@ -88,7 +88,16 @@ func main() {
 		cfg.payload = 8 // need 8 bytes for the embedded timestamp
 	}
 
-	algos := []checksum.Checksum{checksum.NewCRC32C(), checksum.NewSHA256()}
+	algos := []checksum.Checksum{
+		checksum.NewCRC32C(),
+		checksum.NewCRC32IEEE(),
+		checksum.NewAdler32(),
+		checksum.NewCRC64ECMA(),
+		checksum.NewFNV1a64(),
+		checksum.NewMD5(),
+		checksum.NewSHA1(),
+		checksum.NewSHA256(),
+	}
 	results := make([]result, 0, len(algos))
 
 	fmt.Printf("benchmark: %d messages, %d producers, %d consumers, payload=%dB, consumer-sleep=%s\n",

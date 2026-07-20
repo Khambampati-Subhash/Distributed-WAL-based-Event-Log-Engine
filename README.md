@@ -734,7 +734,10 @@ fsync batching (group commit) help throughput**. See
 
 ### What it measures
 
-It runs **two phases per checksum algorithm** (CRC32C and SHA-256):
+It runs **two phases per checksum algorithm**. Eight ship, spanning the
+cost/strength/width tradeoff (all standard-library, so the module stays
+dependency-free): `crc32c`, `crc32-ieee`, `adler32`, `crc64-ecma`, `fnv1a-64`,
+`md5`, `sha1`, `sha256`.
 
 1. **Pure checksum microbenchmark** — computes millions of checksums directly to
    isolate raw cost: **ns/op, MB/s, allocations/op**. This is where the algorithm
@@ -824,14 +827,26 @@ The raw checksum cost also has standard `go test` benchmarks:
 go test -bench=. -benchmem ./internal/checksum/
 ```
 
-On the reference machine (Apple M4 Max):
+All eight algorithms over a 128-byte record on the reference machine (Apple M4
+Max), fastest first:
 
 ```
-BenchmarkCRC32C_128B-16    27.97 ns/op    4719 MB/s    2 allocs/op
-BenchmarkSHA256_128B-16    96.40 ns/op    1369 MB/s    2 allocs/op   (~3.4x slower)
-BenchmarkCRC32C_4KB-16     377.8 ns/op   10852 MB/s    2 allocs/op
-BenchmarkSHA256_4KB-16      1366 ns/op    3002 MB/s    2 allocs/op   (~3.6x slower)
+BenchmarkCRC32C_128B-16       25.62 ns/op   5153 MB/s   2 allocs/op
+BenchmarkCRC32IEEE_128B-16    44.48 ns/op   2968 MB/s   3 allocs/op
+BenchmarkAdler32_128B-16      57.14 ns/op   2310 MB/s   3 allocs/op
+BenchmarkSHA256_128B-16       95.99 ns/op   1375 MB/s   2 allocs/op
+BenchmarkCRC64ECMA_128B-16   100.0  ns/op   1319 MB/s   3 allocs/op
+BenchmarkSHA1_128B-16        111.1  ns/op   1189 MB/s   3 allocs/op
+BenchmarkFNV1a64_128B-16     137.6  ns/op    959 MB/s   3 allocs/op
+BenchmarkMD5_128B-16         252.4  ns/op    523 MB/s   3 allocs/op
 ```
+
+> **Surprise worth internalizing:** "cryptographic = slow" is wrong here. On this
+> Apple Silicon chip **SHA-256 (96 ns) beats MD5 (252 ns), SHA-1, FNV-1a, and even
+> CRC-64** — because the CPU has hardware SHA instructions but not for the others.
+> The perennially-recommended-as-fast MD5 is the *slowest* of the eight. Always
+> measure on your target hardware; instruction-level acceleration reshuffles the
+> ranking. `CRC32C` still wins overall (dedicated CRC32C instruction).
 
 This is the isolated cost that the end-to-end dashboard hides behind fsync at low
 concurrency and reveals at high concurrency.
