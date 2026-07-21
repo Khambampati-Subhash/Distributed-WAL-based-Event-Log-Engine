@@ -275,6 +275,28 @@ if polyglot clients become a priority.
 
 ---
 
+## Phases 8–11 — Distributed (planned)
+
+The single-node engine is complete (durable append, CRC, segments, retention,
+sparse checkpoint recovery, group-commit fsync, pluggable checksum, TCP network +
+public client). Making it genuinely *distributed* is the remaining arc. The full
+plan — how replication and partitioning map onto this codebase, the produce flow,
+and the edge cases — is in **[`REPLICATION_PLAN.md`](REPLICATION_PLAN.md)**.
+
+| Phase | Adds | Why this order |
+|-------|------|----------------|
+| **8 — Raft replication** | one partition survives a node failure (leader/follower, majority commit) | correctness under failure comes first |
+| **9 — Snapshots / compaction** | bounded Raft log, fast follower catch-up | required before replication scales |
+| **10 — Partitioning + controller** | many independent partitions (each a Raft group), metadata group, client routing | scale *after* it's fault-tolerant |
+| **11 — Consumer groups** | parallel consumption, server-side per-group offsets, rebalancing | the consumer side of scale |
+
+Note: earlier notes in this file that say "consumer groups (Phase 8)" now map to
+**Phase 11** — the numbering was refined once replication was scoped as Phase 8.
+See [`DISTRIBUTED_STUDY_PLAN.md`](DISTRIBUTED_STUDY_PLAN.md) for the theory to
+learn before starting Phase 8.
+
+---
+
 ## Open design questions
 
 ### Consumer offset consistency with batched commits
