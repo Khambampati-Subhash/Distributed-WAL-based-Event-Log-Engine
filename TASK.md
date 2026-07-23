@@ -283,6 +283,16 @@ public client). Making it genuinely *distributed* is the remaining arc. The full
 plan — how replication and partitioning map onto this codebase, the produce flow,
 and the edge cases — is in **[`REPLICATION_PLAN.md`](REPLICATION_PLAN.md)**.
 
+**Phase 8 progress — leader election (done).** `internal/raft` now implements
+Raft leader election: terms as a logical clock, randomized election timeouts,
+RequestVote + heartbeat AppendEntries, and step-down on seeing a higher term. It
+talks to peers only through a `Transport` interface, so a cluster is wired
+in-memory and tested deterministically (single-leader election, re-election after
+leader crash, old-leader step-down on rejoin, isolated node never elects itself —
+all under `-race`). Nothing touches the WAL yet. **Next:** log replication
+(AppendEntries carries entries + commit index), then persistence, then WAL
+integration.
+
 | Phase | Adds | Why this order |
 |-------|------|----------------|
 | **8 — Raft replication** | one partition survives a node failure (leader/follower, majority commit) | correctness under failure comes first |
