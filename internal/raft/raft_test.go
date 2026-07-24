@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -74,12 +76,20 @@ func (t *transport) SendAppendEntries(to NodeID, args AppendEntriesArgs) (Append
 type cluster struct {
 	net   *network
 	nodes []*Raft
+
+	appliedMu sync.Mutex
+	applied   []map[uint64][]byte // per node: committed index -> command
+	applyChs  []chan ApplyMsg
 }
 
 func newCluster(t *testing.T, n int) *cluster {
 	t.Helper()
 	net := newNetwork()
-	c := &cluster{net: net}
+	c := &cluster{
+		net:      net,
+		applied:  make([]map[uint64][]byte, n),
+		applyChs: make([]chan ApplyMsg, n),
+	}
 	ids := make([]NodeID, n)
 	for i := 0; i < n; i++ {
 		ids[i] = NodeID(i)
@@ -91,26 +101,103 @@ func newCluster(t *testing.T, n int) *cluster {
 				peers = append(peers, ids[j])
 			}
 		}
+		c.applied[i] = map[uint64][]byte{}
+		ch := make(chan ApplyMsg, 256)
+		c.applyChs[i] = ch
 		r := New(Config{
 			ID:                 ids[i],
 			Peers:              peers,
 			Transport:          &transport{net: net, from: ids[i]},
+			ApplyCh:            ch,
 			HeartbeatInterval:  20 * time.Millisecond,
 			ElectionTimeoutMin: 60 * time.Millisecond,
 			ElectionTimeoutMax: 120 * time.Millisecond,
 		})
 		net.add(r)
 		c.nodes = append(c.nodes, r)
+
+		// Record everything this node applies, so tests can assert what committed.
+		go func(idx int, ch chan ApplyMsg) {
+			for msg := range ch {
+				if !msg.CommandValid {
+					continue
+				}
+				c.appliedMu.Lock()
+				c.applied[idx][msg.CommandIndex] = msg.Command
+				c.appliedMu.Unlock()
+			}
+		}(i, ch)
 	}
 	for _, r := range c.nodes {
-		r.Start()
+		r.Run()
 	}
 	t.Cleanup(func() {
 		for _, r := range c.nodes {
 			r.Stop()
 		}
+		for _, ch := range c.applyChs {
+			close(ch) // stop the recorder goroutines (nodes have stopped applying)
+		}
 	})
 	return c
+}
+
+func (c *cluster) majority() int { return len(c.nodes)/2 + 1 }
+
+// committedAt returns how many nodes applied the given index and the command
+// they applied. If two nodes applied DIFFERENT commands at the same index that
+// is a safety violation, signalled by count == -1.
+func (c *cluster) committedAt(index uint64) (int, []byte) {
+	c.appliedMu.Lock()
+	defer c.appliedMu.Unlock()
+	count := 0
+	var cmd []byte
+	for i := range c.nodes {
+		got, ok := c.applied[i][index]
+		if !ok {
+			continue
+		}
+		if count > 0 && !bytes.Equal(cmd, got) {
+			return -1, nil
+		}
+		cmd = got
+		count++
+	}
+	return count, cmd
+}
+
+// one submits a command and waits until a majority has committed it at the same
+// index, returning that index. It retries against whichever node is leader,
+// absorbing elections — the standard Raft test workhorse.
+func (c *cluster) one(t *testing.T, cmd []byte) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		var index uint64
+		submitted := false
+		for _, r := range c.nodes {
+			if idx, _, isLeader := r.Start(cmd); isLeader {
+				index, submitted = idx, true
+				break
+			}
+		}
+		if submitted {
+			until := time.Now().Add(1 * time.Second)
+			for time.Now().Before(until) {
+				count, got := c.committedAt(index)
+				if count < 0 {
+					t.Fatalf("conflicting commands committed at index %d", index)
+				}
+				if count >= c.majority() && bytes.Equal(got, cmd) {
+					return index
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("command %q never committed on a majority", cmd)
+	return 0
 }
 
 // leadersByTerm returns every CONNECTED node claiming to be leader, grouped by
@@ -241,4 +328,104 @@ func TestIsolatedNodeCannotBecomeLeader(t *testing.T) {
 
 	// Meanwhile the majority side (2 of 3) still has its leader.
 	c.checkOneLeader(t)
+}
+
+// --- log replication (step 2) ---
+
+func TestReplicateSingleCommand(t *testing.T) {
+	c := newCluster(t, 3)
+	c.checkOneLeader(t)
+
+	index := c.one(t, []byte("hello"))
+	if index != 1 {
+		t.Fatalf("first command should land at index 1, got %d", index)
+	}
+	// Every node (not just a majority) should converge on it shortly.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if count, _ := c.committedAt(index); count == len(c.nodes) {
+			return
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	count, _ := c.committedAt(index)
+	t.Fatalf("only %d/%d nodes applied index %d", count, len(c.nodes), index)
+}
+
+func TestReplicateSequentialCommands(t *testing.T) {
+	c := newCluster(t, 3)
+	c.checkOneLeader(t)
+
+	for i := 1; i <= 5; i++ {
+		cmd := fmt.Appendf(nil, "cmd-%d", i)
+		index := c.one(t, cmd)
+		if index != uint64(i) {
+			t.Fatalf("command %d committed at index %d, want %d", i, index, i)
+		}
+	}
+}
+
+func TestNoCommitWithoutMajority(t *testing.T) {
+	c := newCluster(t, 3)
+	leader := c.checkOneLeader(t)
+
+	// Isolate the two followers → the leader is now a minority and cannot commit.
+	var others []NodeID
+	for _, r := range c.nodes {
+		if r.id != leader {
+			others = append(others, r.id)
+		}
+	}
+	c.net.setConnected(others[0], false)
+	c.net.setConnected(others[1], false)
+
+	index, _, ok := c.nodes[leader].Start([]byte("orphan"))
+	if !ok {
+		t.Skip("leader stepped down before we could propose; timing — rerun")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if count, _ := c.committedAt(index); count > 0 {
+		t.Fatalf("index %d committed (%d nodes) without a majority", index, count)
+	}
+
+	// Restore the majority; the cluster must be able to commit again.
+	c.net.setConnected(others[0], true)
+	c.net.setConnected(others[1], true)
+	c.one(t, []byte("recovered"))
+}
+
+func TestFollowerCatchesUp(t *testing.T) {
+	c := newCluster(t, 3)
+	c.one(t, []byte("a"))
+
+	leader := c.checkOneLeader(t)
+	var follower NodeID = None
+	for _, r := range c.nodes {
+		if r.id != leader {
+			follower = r.id
+			break
+		}
+	}
+
+	// While a follower is away, the majority keeps committing.
+	c.net.setConnected(follower, false)
+	c.one(t, []byte("b"))
+	c.one(t, []byte("c"))
+
+	// Reconnect: the lagging follower must catch up and apply all three entries.
+	c.net.setConnected(follower, true)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c.appliedMu.Lock()
+		n := len(c.applied[follower])
+		c.appliedMu.Unlock()
+		if n >= 3 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.appliedMu.Lock()
+	n := len(c.applied[follower])
+	c.appliedMu.Unlock()
+	t.Fatalf("follower %d caught up only %d/3 entries", follower, n)
 }

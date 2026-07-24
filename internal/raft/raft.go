@@ -1,20 +1,17 @@
-// Package raft implements the Raft consensus algorithm, the mechanism that will
-// let the log survive a node failure (Phase 8). This is built incrementally, the
-// way the Raft paper and the MIT 6.5840 labs do it:
+// Package raft implements the Raft consensus algorithm, the mechanism that lets
+// the log survive a node failure (Phase 8). It is built incrementally, the way
+// the Raft paper and the MIT 6.5840 labs do it:
 //
-//	step 1 — leader election      (this file)
-//	step 2 — log replication      (AppendEntries carries entries; commit index)
+//	step 1 — leader election      (terms, votes, heartbeats)
+//	step 2 — log replication      (this file: entries, commit index, apply)  ← done
 //	step 3 — persistence          (term/votedFor/log survive restart)
 //	step 4 — snapshots            (bound the log)
 //	step 5 — integrate with the WAL (apply committed entries to segment.Manager)
 //
 // The node talks to peers only through the Transport interface, so a whole
-// cluster can be wired together in-memory and tested deterministically before any
-// TCP is involved. Nothing here touches the WAL yet.
-//
-// This file covers leader election: terms as a logical clock, randomized election
-// timeouts, RequestVote, and heartbeats via (empty) AppendEntries. The safety
-// property it guarantees is "at most one leader per term".
+// cluster is wired in-memory and tested deterministically before any TCP is
+// involved. Committed commands are delivered, in order, on an apply channel — the
+// seam where the WAL will later plug in as the state machine.
 package raft
 
 import (
@@ -30,8 +27,22 @@ type Term uint64
 // NodeID identifies a node in the cluster.
 type NodeID int
 
-// None marks "no vote cast this term".
+// None marks "no vote cast this term" / "no leader known".
 const None NodeID = -1
+
+// LogEntry is one replicated command tagged with the term it was created in. The
+// term is what makes the log self-describing enough for the consistency check.
+type LogEntry struct {
+	Term    Term
+	Command []byte
+}
+
+// ApplyMsg is a committed entry handed to the state machine, in log order.
+type ApplyMsg struct {
+	CommandValid bool
+	Command      []byte
+	CommandIndex uint64
+}
 
 // State is a node's role. A node is exactly one of these at any moment.
 type State int
@@ -68,6 +79,7 @@ type Config struct {
 	ID        NodeID
 	Peers     []NodeID // the OTHER nodes (self is not included)
 	Transport Transport
+	ApplyCh   chan ApplyMsg // committed commands are delivered here, in order
 
 	HeartbeatInterval  time.Duration
 	ElectionTimeoutMin time.Duration
@@ -76,7 +88,8 @@ type Config struct {
 
 // Raft is a single node in the cluster.
 type Raft struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	applyCond *sync.Cond
 
 	id        NodeID
 	peers     []NodeID
@@ -89,18 +102,26 @@ type Raft struct {
 	// Persistent state (will be written to disk in step 3).
 	currentTerm Term
 	votedFor    NodeID
+	log         []LogEntry // log[0] is a sentinel; real entries start at index 1
 
-	// Volatile state.
+	// Volatile state on all nodes.
 	state            State
 	leaderID         NodeID
-	electionDeadline time.Time // when a follower/candidate will start an election
+	commitIndex      uint64 // highest log index known committed
+	lastApplied      uint64 // highest log index handed to the state machine
+	electionDeadline time.Time
 
+	// Volatile state on leaders, reset on election.
+	nextIndex  map[NodeID]uint64 // next index to send to each follower
+	matchIndex map[NodeID]uint64 // highest index known replicated on each follower
+
+	applyCh  chan ApplyMsg
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
-// New builds a node in the Follower state. Call Start to run its timers.
+// New builds a node in the Follower state. Call Start (Run) to run its loops.
 func New(cfg Config) *Raft {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = DefaultHeartbeatInterval
@@ -111,6 +132,9 @@ func New(cfg Config) *Raft {
 	if cfg.ElectionTimeoutMax <= cfg.ElectionTimeoutMin {
 		cfg.ElectionTimeoutMax = cfg.ElectionTimeoutMin * 2
 	}
+	if cfg.ApplyCh == nil {
+		cfg.ApplyCh = make(chan ApplyMsg, 256)
+	}
 	r := &Raft{
 		id:                 cfg.ID,
 		peers:              append([]NodeID(nil), cfg.Peers...),
@@ -120,25 +144,49 @@ func New(cfg Config) *Raft {
 		electionTimeoutMax: cfg.ElectionTimeoutMax,
 		currentTerm:        0,
 		votedFor:           None,
+		log:                []LogEntry{{Term: 0}}, // sentinel at index 0
 		state:              Follower,
 		leaderID:           None,
+		applyCh:            cfg.ApplyCh,
 		stopCh:             make(chan struct{}),
 	}
+	r.applyCond = sync.NewCond(&r.mu)
 	r.resetElectionDeadlineLocked()
 	return r
 }
 
-// Start launches the election and heartbeat loops.
-func (r *Raft) Start() {
-	r.wg.Add(2)
+// Run launches the election, heartbeat, and apply loops.
+func (r *Raft) Run() {
+	r.wg.Add(3)
 	go r.electionLoop()
 	go r.heartbeatLoop()
+	go r.applyLoop()
 }
 
 // Stop halts the node's loops. Safe to call more than once.
 func (r *Raft) Stop() {
-	r.stopOnce.Do(func() { close(r.stopCh) })
+	r.stopOnce.Do(func() {
+		r.mu.Lock()
+		close(r.stopCh)
+		r.applyCond.Broadcast() // wake the apply loop so it can exit
+		r.mu.Unlock()
+	})
 	r.wg.Wait()
+}
+
+// Start proposes a command. On the leader it appends the command to the log and
+// returns the index it will occupy once committed, the current term, and true.
+// On a non-leader it returns isLeader=false and the caller should retry elsewhere.
+func (r *Raft) Start(command []byte) (index uint64, term Term, isLeader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader {
+		return 0, r.currentTerm, false
+	}
+	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: command})
+	index = uint64(len(r.log) - 1)
+	go r.broadcastAppendEntries() // replicate promptly rather than waiting for the tick
+	return index, r.currentTerm, true
 }
 
 // State returns the node's current role.
@@ -155,11 +203,10 @@ func (r *Raft) CurrentTerm() Term {
 	return r.currentTerm
 }
 
-// clusterSize is the total number of nodes (peers + self).
 func (r *Raft) clusterSize() int { return len(r.peers) + 1 }
+func (r *Raft) majority() int    { return r.clusterSize()/2 + 1 }
 
-// majority is the smallest number of votes that forms a majority.
-func (r *Raft) majority() int { return r.clusterSize()/2 + 1 }
+func (r *Raft) lastIndexLocked() uint64 { return uint64(len(r.log) - 1) }
 
 func (r *Raft) resetElectionDeadlineLocked() {
 	span := r.electionTimeoutMax - r.electionTimeoutMin
@@ -176,8 +223,6 @@ func (r *Raft) becomeFollowerLocked(term Term) {
 	r.resetElectionDeadlineLocked()
 }
 
-// electionLoop starts an election whenever a follower/candidate goes too long
-// without hearing from a leader (or winning).
 func (r *Raft) electionLoop() {
 	defer r.wg.Done()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -197,7 +242,6 @@ func (r *Raft) electionLoop() {
 	}
 }
 
-// heartbeatLoop makes the leader broadcast heartbeats so followers stay put.
 func (r *Raft) heartbeatLoop() {
 	defer r.wg.Done()
 	ticker := time.NewTicker(r.heartbeatInterval)
@@ -207,12 +251,41 @@ func (r *Raft) heartbeatLoop() {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			r.sendHeartbeats()
+			r.broadcastAppendEntries()
 		}
 	}
 }
 
-// startElection transitions to Candidate, votes for self, and asks peers for votes.
+// applyLoop delivers committed entries to the state machine in index order.
+func (r *Raft) applyLoop() {
+	defer r.wg.Done()
+	for {
+		r.mu.Lock()
+		for r.lastApplied >= r.commitIndex {
+			select {
+			case <-r.stopCh:
+				r.mu.Unlock()
+				return
+			default:
+			}
+			r.applyCond.Wait()
+		}
+		r.lastApplied++
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      r.log[r.lastApplied].Command,
+			CommandIndex: r.lastApplied,
+		}
+		r.mu.Unlock()
+
+		select {
+		case r.applyCh <- msg:
+		case <-r.stopCh:
+			return
+		}
+	}
+}
+
 func (r *Raft) startElection() {
 	r.mu.Lock()
 	r.state = Candidate
@@ -225,8 +298,7 @@ func (r *Raft) startElection() {
 	peers := append([]NodeID(nil), r.peers...)
 	r.mu.Unlock()
 
-	votes := 1 // vote for self
-
+	votes := 1 // self
 	for _, peer := range peers {
 		go func(peer NodeID) {
 			args := RequestVoteArgs{
@@ -239,10 +311,8 @@ func (r *Raft) startElection() {
 			if err != nil {
 				return
 			}
-
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			// Ignore if we moved on (newer term or no longer a candidate for `term`).
 			if r.state != Candidate || r.currentTerm != term {
 				return
 			}
@@ -261,46 +331,118 @@ func (r *Raft) startElection() {
 	}
 }
 
-// becomeLeaderLocked wins the election and immediately asserts authority with a
-// heartbeat (so followers don't start competing elections).
+// becomeLeaderLocked wins the election, initializes per-follower replication
+// state, and immediately asserts authority with a heartbeat.
 func (r *Raft) becomeLeaderLocked() {
 	if r.state != Candidate {
 		return
 	}
 	r.state = Leader
 	r.leaderID = r.id
-	go r.sendHeartbeats()
+	last := r.lastIndexLocked()
+	r.nextIndex = make(map[NodeID]uint64, len(r.peers))
+	r.matchIndex = make(map[NodeID]uint64, len(r.peers))
+	for _, p := range r.peers {
+		r.nextIndex[p] = last + 1
+		r.matchIndex[p] = 0
+	}
+	go r.broadcastAppendEntries()
 }
 
-// sendHeartbeats broadcasts empty AppendEntries if we are the leader.
-func (r *Raft) sendHeartbeats() {
+func (r *Raft) broadcastAppendEntries() {
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return
+	}
+	peers := append([]NodeID(nil), r.peers...)
+	r.mu.Unlock()
+	for _, peer := range peers {
+		go r.replicateTo(peer)
+	}
+}
+
+// replicateTo sends the follower the entries it is missing (or a bare heartbeat),
+// then updates match/next index and the commit point based on the reply.
+func (r *Raft) replicateTo(peer NodeID) {
 	r.mu.Lock()
 	if r.state != Leader {
 		r.mu.Unlock()
 		return
 	}
 	term := r.currentTerm
-	peers := append([]NodeID(nil), r.peers...)
+	ni := r.nextIndex[peer]
+	if ni < 1 {
+		ni = 1
+	}
+	prevIndex := ni - 1
+	prevTerm := r.log[prevIndex].Term
+	entries := append([]LogEntry(nil), r.log[ni:]...)
+	leaderCommit := r.commitIndex
 	r.mu.Unlock()
 
-	for _, peer := range peers {
-		go func(peer NodeID) {
-			args := AppendEntriesArgs{Term: term, LeaderID: r.id}
-			reply, err := r.transport.SendAppendEntries(peer, args)
-			if err != nil {
-				return
-			}
-			r.mu.Lock()
-			if reply.Term > r.currentTerm {
-				r.becomeFollowerLocked(reply.Term)
-			}
-			r.mu.Unlock()
-		}(peer)
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderID:     r.id,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: leaderCommit,
+	}
+	reply, err := r.transport.SendAppendEntries(peer, args)
+	if err != nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader || r.currentTerm != term {
+		return
+	}
+	if reply.Term > r.currentTerm {
+		r.becomeFollowerLocked(reply.Term)
+		return
+	}
+	if reply.Success {
+		r.matchIndex[peer] = prevIndex + uint64(len(entries))
+		r.nextIndex[peer] = r.matchIndex[peer] + 1
+		r.advanceCommitLocked()
+		return
+	}
+	// Rejected: back up nextIndex toward the conflict and retry on the next tick.
+	if reply.ConflictIndex > 0 {
+		r.nextIndex[peer] = reply.ConflictIndex
+	} else if r.nextIndex[peer] > 1 {
+		r.nextIndex[peer]--
 	}
 }
 
-// lastLogTermIndexLocked returns the term and index of the last log entry. With
-// no log yet (leader election only), both are zero; step 2 fills this in.
+// advanceCommitLocked moves commitIndex forward to the highest index replicated
+// on a majority — but only for an entry from the CURRENT term. Committing an
+// older-term entry only indirectly (by committing a current-term entry above it)
+// is the Figure-8 safety rule; skipping it can lose committed data.
+func (r *Raft) advanceCommitLocked() {
+	for n := r.lastIndexLocked(); n > r.commitIndex; n-- {
+		if r.log[n].Term != r.currentTerm {
+			continue
+		}
+		count := 1 // self
+		for _, p := range r.peers {
+			if r.matchIndex[p] >= n {
+				count++
+			}
+		}
+		if count >= r.majority() {
+			r.commitIndex = n
+			r.applyCond.Signal()
+			return
+		}
+	}
+}
+
+// lastLogTermIndexLocked returns the term and index of the last log entry (used
+// by the election restriction so a stale-log candidate cannot win).
 func (r *Raft) lastLogTermIndexLocked() (Term, uint64) {
-	return 0, 0
+	idx := r.lastIndexLocked()
+	return r.log[idx].Term, idx
 }

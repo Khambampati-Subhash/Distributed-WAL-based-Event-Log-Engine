@@ -283,15 +283,20 @@ public client). Making it genuinely *distributed* is the remaining arc. The full
 plan — how replication and partitioning map onto this codebase, the produce flow,
 and the edge cases — is in **[`REPLICATION_PLAN.md`](REPLICATION_PLAN.md)**.
 
-**Phase 8 progress — leader election (done).** `internal/raft` now implements
-Raft leader election: terms as a logical clock, randomized election timeouts,
-RequestVote + heartbeat AppendEntries, and step-down on seeing a higher term. It
-talks to peers only through a `Transport` interface, so a cluster is wired
-in-memory and tested deterministically (single-leader election, re-election after
-leader crash, old-leader step-down on rejoin, isolated node never elects itself —
-all under `-race`). Nothing touches the WAL yet. **Next:** log replication
-(AppendEntries carries entries + commit index), then persistence, then WAL
-integration.
+**Phase 8 progress — `internal/raft`:**
+- **Step 1 — leader election (done).** Terms as a logical clock, randomized
+  election timeouts, RequestVote + heartbeat AppendEntries, step-down on a higher
+  term. Transport-abstracted; tested in-memory (single-leader election,
+  re-election after leader crash, old-leader step-down on rejoin, isolated node
+  never elects itself).
+- **Step 2 — log replication (done).** A replicated log with the log-matching
+  consistency check + conflict-index fast backup, commit-on-majority using the
+  **Figure-8 current-term rule**, and an ordered apply channel (the seam where the
+  WAL will plug in). Tested: single/sequential command replication, no-commit
+  without a majority (then recovery), and a lagging follower catching up. All
+  under `-race`, stable across repeated runs.
+- **Next:** step 3 persistence (term/votedFor/log survive restart), step 4
+  snapshots, step 5 WAL integration (apply committed entries via `segment.Manager`).
 
 | Phase | Adds | Why this order |
 |-------|------|----------------|

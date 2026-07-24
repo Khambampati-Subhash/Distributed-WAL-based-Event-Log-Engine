@@ -10,7 +10,7 @@ type Transport interface {
 
 // RequestVoteArgs is a candidate asking a peer for its vote (Raft paper §5.2).
 // The LastLog fields let a voter refuse a candidate whose log is behind its own
-// (the "election restriction"); with no log yet they are zero.
+// (the "election restriction").
 type RequestVoteArgs struct {
 	Term         Term
 	CandidateID  NodeID
@@ -24,16 +24,23 @@ type RequestVoteReply struct {
 }
 
 // AppendEntriesArgs is the leader replicating entries — and, with an empty
-// Entries list, the heartbeat that keeps followers from starting elections. The
-// log fields (PrevLog*, Entries, LeaderCommit) arrive in step 2.
+// Entries list, the heartbeat that keeps followers from starting elections.
+// PrevLog{Index,Term} anchor the entries for the log-matching consistency check.
 type AppendEntriesArgs struct {
-	Term     Term
-	LeaderID NodeID
+	Term         Term
+	LeaderID     NodeID
+	PrevLogIndex uint64
+	PrevLogTerm  Term
+	Entries      []LogEntry
+	LeaderCommit uint64
 }
 
+// AppendEntriesReply carries ConflictIndex so a leader whose PrevLog check failed
+// can back up nextIndex quickly instead of one entry per round-trip.
 type AppendEntriesReply struct {
-	Term    Term
-	Success bool
+	Term          Term
+	Success       bool
+	ConflictIndex uint64
 }
 
 // RequestVote handles an incoming vote request. A node grants its vote at most
@@ -43,7 +50,6 @@ func (r *Raft) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Any message from a newer term makes us a follower of that term first.
 	if args.Term > r.currentTerm {
 		r.becomeFollowerLocked(args.Term)
 	}
@@ -62,29 +68,62 @@ func (r *Raft) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	return reply
 }
 
-// AppendEntries handles an incoming heartbeat / replication request. For leader
-// election it establishes that a legitimate leader exists for the term: the node
-// steps down if needed, records the leader, and resets its election timer.
+// AppendEntries handles heartbeats and log replication. It runs the log-matching
+// consistency check, appends/overwrites entries, and advances the commit index.
 func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	reply := AppendEntriesReply{Term: r.currentTerm}
 	if args.Term < r.currentTerm {
-		return reply // stale leader; reject (Success = false)
+		return reply // stale leader; reject
 	}
 
-	// A valid leader for this term (>= ours): adopt its term, become a follower,
-	// and reset our election timer so we don't challenge it.
+	// A valid leader for this term: adopt its term, become a follower, reset timer.
 	if args.Term > r.currentTerm {
 		r.becomeFollowerLocked(args.Term)
 	}
 	r.state = Follower
 	r.leaderID = args.LeaderID
 	r.resetElectionDeadlineLocked()
-
 	reply.Term = r.currentTerm
-	reply.Success = true // log consistency checks come in step 2
+
+	// Consistency check: we must already have PrevLogIndex with a matching term,
+	// or the leader must back up. ConflictIndex tells it how far.
+	if args.PrevLogIndex > r.lastIndexLocked() {
+		reply.ConflictIndex = r.lastIndexLocked() + 1 // our log is too short
+		return reply
+	}
+	if r.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Skip the whole conflicting term so the leader backs up in one hop.
+		conflictTerm := r.log[args.PrevLogIndex].Term
+		ci := args.PrevLogIndex
+		for ci > 1 && r.log[ci-1].Term == conflictTerm {
+			ci--
+		}
+		reply.ConflictIndex = ci
+		return reply
+	}
+
+	// The prefix matches. Append new entries, truncating only on a real conflict
+	// (a matching duplicate must NOT truncate — it may cover committed entries).
+	for i := range args.Entries {
+		idx := args.PrevLogIndex + 1 + uint64(i)
+		if idx <= r.lastIndexLocked() && r.log[idx].Term == args.Entries[i].Term {
+			continue
+		}
+		r.log = append(r.log[:idx], args.Entries[i:]...)
+		break
+	}
+
+	// Advance our commit point, but never past the last entry this RPC delivered.
+	if args.LeaderCommit > r.commitIndex {
+		lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+		r.commitIndex = min(args.LeaderCommit, lastNew)
+		r.applyCond.Signal()
+	}
+
+	reply.Success = true
 	return reply
 }
 
