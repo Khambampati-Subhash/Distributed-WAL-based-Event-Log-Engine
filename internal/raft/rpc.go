@@ -50,13 +50,15 @@ func (r *Raft) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	changed := false
 	if args.Term > r.currentTerm {
 		r.becomeFollowerLocked(args.Term)
+		changed = true
 	}
 
 	reply := RequestVoteReply{Term: r.currentTerm}
 	if args.Term < r.currentTerm {
-		return reply // stale candidate; reject
+		return reply // stale candidate; reject (nothing changed)
 	}
 
 	alreadyVoted := r.votedFor != None && r.votedFor != args.CandidateID
@@ -64,6 +66,10 @@ func (r *Raft) RequestVote(args RequestVoteArgs) RequestVoteReply {
 		r.votedFor = args.CandidateID
 		r.resetElectionDeadlineLocked() // granting a vote counts as "heard from" the cluster
 		reply.VoteGranted = true
+		changed = true
+	}
+	if changed {
+		r.persistLocked() // the vote/term must be durable before we reply
 	}
 	return reply
 }
@@ -76,12 +82,14 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	reply := AppendEntriesReply{Term: r.currentTerm}
 	if args.Term < r.currentTerm {
-		return reply // stale leader; reject
+		return reply // stale leader; reject (nothing changed)
 	}
 
 	// A valid leader for this term: adopt its term, become a follower, reset timer.
+	changed := false
 	if args.Term > r.currentTerm {
 		r.becomeFollowerLocked(args.Term)
+		changed = true
 	}
 	r.state = Follower
 	r.leaderID = args.LeaderID
@@ -89,9 +97,13 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	reply.Term = r.currentTerm
 
 	// Consistency check: we must already have PrevLogIndex with a matching term,
-	// or the leader must back up. ConflictIndex tells it how far.
+	// or the leader must back up. ConflictIndex tells it how far. Even on reject we
+	// persist if the term changed above.
 	if args.PrevLogIndex > r.lastIndexLocked() {
 		reply.ConflictIndex = r.lastIndexLocked() + 1 // our log is too short
+		if changed {
+			r.persistLocked()
+		}
 		return reply
 	}
 	if r.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -102,6 +114,9 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 			ci--
 		}
 		reply.ConflictIndex = ci
+		if changed {
+			r.persistLocked()
+		}
 		return reply
 	}
 
@@ -113,6 +128,7 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 			continue
 		}
 		r.log = append(r.log[:idx], args.Entries[i:]...)
+		changed = true
 		break
 	}
 
@@ -123,6 +139,9 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		r.applyCond.Signal()
 	}
 
+	if changed {
+		r.persistLocked() // durable log/term before we acknowledge success
+	}
 	reply.Success = true
 	return reply
 }

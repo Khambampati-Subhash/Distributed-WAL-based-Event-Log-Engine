@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -80,6 +81,7 @@ type Config struct {
 	Peers     []NodeID // the OTHER nodes (self is not included)
 	Transport Transport
 	ApplyCh   chan ApplyMsg // committed commands are delivered here, in order
+	Storage   Storage       // where term/votedFor/log are persisted; nil = in-memory
 
 	HeartbeatInterval  time.Duration
 	ElectionTimeoutMin time.Duration
@@ -115,6 +117,7 @@ type Raft struct {
 	nextIndex  map[NodeID]uint64 // next index to send to each follower
 	matchIndex map[NodeID]uint64 // highest index known replicated on each follower
 
+	storage  Storage
 	applyCh  chan ApplyMsg
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -135,6 +138,9 @@ func New(cfg Config) *Raft {
 	if cfg.ApplyCh == nil {
 		cfg.ApplyCh = make(chan ApplyMsg, 256)
 	}
+	if cfg.Storage == nil {
+		cfg.Storage = NewMemoryStorage()
+	}
 	r := &Raft{
 		id:                 cfg.ID,
 		peers:              append([]NodeID(nil), cfg.Peers...),
@@ -147,12 +153,48 @@ func New(cfg Config) *Raft {
 		log:                []LogEntry{{Term: 0}}, // sentinel at index 0
 		state:              Follower,
 		leaderID:           None,
+		storage:            cfg.Storage,
 		applyCh:            cfg.ApplyCh,
 		stopCh:             make(chan struct{}),
 	}
 	r.applyCond = sync.NewCond(&r.mu)
+	r.loadPersistedState()
 	r.resetElectionDeadlineLocked()
 	return r
+}
+
+// loadPersistedState restores term/votedFor/log from storage on startup, so a
+// restarted node picks up exactly where it left off.
+func (r *Raft) loadPersistedState() {
+	state, ok, err := r.storage.Load()
+	if err != nil {
+		// A production node would refuse to start; for this project we log loudly
+		// and start fresh rather than crash.
+		log.Printf("raft %d: load persisted state: %v", r.id, err)
+		return
+	}
+	if !ok {
+		return
+	}
+	r.currentTerm = state.CurrentTerm
+	r.votedFor = state.VotedFor
+	if len(state.Log) > 0 {
+		r.log = state.Log
+	}
+}
+
+// persistLocked writes the current term/votedFor/log to stable storage. It must
+// be called (under r.mu) after any change to those fields and BEFORE the RPC that
+// caused the change replies — that ordering is what makes Raft crash-safe.
+func (r *Raft) persistLocked() {
+	state := PersistentState{
+		CurrentTerm: r.currentTerm,
+		VotedFor:    r.votedFor,
+		Log:         append([]LogEntry(nil), r.log...),
+	}
+	if err := r.storage.Save(state); err != nil {
+		log.Printf("raft %d: persist: %v", r.id, err)
+	}
 }
 
 // Run launches the election, heartbeat, and apply loops.
@@ -185,6 +227,7 @@ func (r *Raft) Start(command []byte) (index uint64, term Term, isLeader bool) {
 	}
 	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: command})
 	index = uint64(len(r.log) - 1)
+	r.persistLocked()             // the new entry must be durable before we replicate it
 	go r.broadcastAppendEntries() // replicate promptly rather than waiting for the tick
 	return index, r.currentTerm, true
 }
@@ -293,6 +336,7 @@ func (r *Raft) startElection() {
 	r.votedFor = r.id
 	r.leaderID = None
 	r.resetElectionDeadlineLocked()
+	r.persistLocked() // new term + self-vote must be durable before we ask for votes
 	term := r.currentTerm
 	lastLogTerm, lastLogIndex := r.lastLogTermIndexLocked()
 	peers := append([]NodeID(nil), r.peers...)
@@ -318,6 +362,7 @@ func (r *Raft) startElection() {
 			}
 			if reply.Term > r.currentTerm {
 				r.becomeFollowerLocked(reply.Term)
+				r.persistLocked()
 				return
 			}
 			if !reply.VoteGranted {

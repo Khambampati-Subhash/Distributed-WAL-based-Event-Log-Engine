@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +78,8 @@ type cluster struct {
 	net   *network
 	nodes []*Raft
 
+	storages []Storage
+
 	appliedMu sync.Mutex
 	applied   []map[uint64][]byte // per node: committed index -> command
 	applyChs  []chan ApplyMsg
@@ -87,34 +90,14 @@ func newCluster(t *testing.T, n int) *cluster {
 	net := newNetwork()
 	c := &cluster{
 		net:      net,
+		storages: make([]Storage, n),
 		applied:  make([]map[uint64][]byte, n),
 		applyChs: make([]chan ApplyMsg, n),
 	}
-	ids := make([]NodeID, n)
 	for i := 0; i < n; i++ {
-		ids[i] = NodeID(i)
-	}
-	for i := 0; i < n; i++ {
-		var peers []NodeID
-		for j := 0; j < n; j++ {
-			if j != i {
-				peers = append(peers, ids[j])
-			}
-		}
+		c.storages[i] = NewMemoryStorage()
 		c.applied[i] = map[uint64][]byte{}
-		ch := make(chan ApplyMsg, 256)
-		c.applyChs[i] = ch
-		r := New(Config{
-			ID:                 ids[i],
-			Peers:              peers,
-			Transport:          &transport{net: net, from: ids[i]},
-			ApplyCh:            ch,
-			HeartbeatInterval:  20 * time.Millisecond,
-			ElectionTimeoutMin: 60 * time.Millisecond,
-			ElectionTimeoutMax: 120 * time.Millisecond,
-		})
-		net.add(r)
-		c.nodes = append(c.nodes, r)
+		c.applyChs[i] = make(chan ApplyMsg, 256)
 
 		// Record everything this node applies, so tests can assert what committed.
 		go func(idx int, ch chan ApplyMsg) {
@@ -126,7 +109,9 @@ func newCluster(t *testing.T, n int) *cluster {
 				c.applied[idx][msg.CommandIndex] = msg.Command
 				c.appliedMu.Unlock()
 			}
-		}(i, ch)
+		}(i, c.applyChs[i])
+
+		c.nodes = append(c.nodes, c.makeNode(i))
 	}
 	for _, r := range c.nodes {
 		r.Run()
@@ -140,6 +125,41 @@ func newCluster(t *testing.T, n int) *cluster {
 		}
 	})
 	return c
+}
+
+// makeNode builds node i, reusing its persistent storage and apply channel so a
+// restart sees exactly what a real reboot would.
+func (c *cluster) makeNode(i int) *Raft {
+	var peers []NodeID
+	for j := range c.applyChs {
+		if j != i {
+			peers = append(peers, NodeID(j))
+		}
+	}
+	r := New(Config{
+		ID:                 NodeID(i),
+		Peers:              peers,
+		Transport:          &transport{net: c.net, from: NodeID(i)},
+		ApplyCh:            c.applyChs[i],
+		Storage:            c.storages[i],
+		HeartbeatInterval:  20 * time.Millisecond,
+		ElectionTimeoutMin: 60 * time.Millisecond,
+		ElectionTimeoutMax: 120 * time.Millisecond,
+	})
+	c.net.add(r)
+	return r
+}
+
+// restart simulates a crash + reboot of node i: stop it, discard its volatile
+// state and its recorded apply history (the state machine is rebuilt from the
+// persisted log), then bring up a fresh node from the SAME storage.
+func (c *cluster) restart(i int) {
+	c.nodes[i].Stop()
+	c.appliedMu.Lock()
+	c.applied[i] = map[uint64][]byte{}
+	c.appliedMu.Unlock()
+	c.nodes[i] = c.makeNode(i)
+	c.nodes[i].Run()
 }
 
 func (c *cluster) majority() int { return len(c.nodes)/2 + 1 }
@@ -428,4 +448,111 @@ func TestFollowerCatchesUp(t *testing.T) {
 	n := len(c.applied[follower])
 	c.appliedMu.Unlock()
 	t.Fatalf("follower %d caught up only %d/3 entries", follower, n)
+}
+
+// --- persistence (step 3) ---
+
+type nopTransport struct{}
+
+func (nopTransport) SendRequestVote(NodeID, RequestVoteArgs) (RequestVoteReply, error) {
+	return RequestVoteReply{}, errDisconnected
+}
+func (nopTransport) SendAppendEntries(NodeID, AppendEntriesArgs) (AppendEntriesReply, error) {
+	return AppendEntriesReply{}, errDisconnected
+}
+
+func TestFileStorageRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft.state")
+
+	if _, ok, err := NewFileStorage(path).Load(); err != nil || ok {
+		t.Fatalf("empty load should be (_, false, nil), got ok=%v err=%v", ok, err)
+	}
+
+	state := PersistentState{
+		CurrentTerm: 7,
+		VotedFor:    2,
+		Log: []LogEntry{
+			{Term: 0},
+			{Term: 5, Command: []byte("x")},
+			{Term: 7, Command: []byte("y")},
+		},
+	}
+	if err := NewFileStorage(path).Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh FileStorage on the same path proves it survived on disk.
+	got, ok, err := NewFileStorage(path).Load()
+	if err != nil || !ok {
+		t.Fatalf("load: ok=%v err=%v", ok, err)
+	}
+	if got.CurrentTerm != 7 || got.VotedFor != 2 || len(got.Log) != 3 {
+		t.Fatalf("mismatch: %+v", got)
+	}
+	if string(got.Log[1].Command) != "x" || string(got.Log[2].Command) != "y" {
+		t.Fatalf("log commands not restored: %+v", got.Log)
+	}
+}
+
+// TestVotedForSurvivesRestart is the safety reason votedFor must be durable: a
+// node that voted in a term must not vote for a DIFFERENT candidate in that same
+// term after a restart, or two leaders could be elected for one term.
+func TestVotedForSurvivesRestart(t *testing.T) {
+	st := NewMemoryStorage()
+	mk := func() *Raft {
+		return New(Config{ID: 0, Peers: []NodeID{1, 2}, Transport: nopTransport{}, Storage: st})
+	}
+
+	r := mk()
+	if reply := r.RequestVote(RequestVoteArgs{Term: 5, CandidateID: 1}); !reply.VoteGranted {
+		t.Fatal("should grant vote to candidate 1 in term 5")
+	}
+
+	// Reboot from the same storage.
+	r2 := mk()
+	if r2.CurrentTerm() != 5 {
+		t.Fatalf("term not restored: got %d want 5", r2.CurrentTerm())
+	}
+	if reply := r2.RequestVote(RequestVoteArgs{Term: 5, CandidateID: 2}); reply.VoteGranted {
+		t.Fatal("must NOT grant a second vote in term 5 after restart")
+	}
+}
+
+func TestClusterSurvivesRestart(t *testing.T) {
+	c := newCluster(t, 3)
+	c.one(t, []byte("a"))
+	c.one(t, []byte("b"))
+	c.one(t, []byte("c"))
+
+	// Crash and reboot every node from its persisted state.
+	for i := range c.nodes {
+		c.restart(i)
+	}
+
+	// A new command commits and (per the Figure-8 rule) advances the commit index
+	// past the restored entries, so a,b,c,d all apply. If persistence were broken,
+	// the reborn nodes would have empty logs and "d" would land at index 1.
+	if idx := c.one(t, []byte("d")); idx != 4 {
+		t.Fatalf("d committed at index %d, want 4 (a,b,c must have survived restart)", idx)
+	}
+
+	want := map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d"}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ok := true
+		for idx, cmd := range want {
+			count, got := c.committedAt(idx)
+			if count < c.majority() || string(got) != cmd {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restored + new entries not all committed on a majority: want %v", want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

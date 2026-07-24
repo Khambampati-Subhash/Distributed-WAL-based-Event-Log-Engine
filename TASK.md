@@ -295,8 +295,16 @@ and the edge cases — is in **[`REPLICATION_PLAN.md`](REPLICATION_PLAN.md)**.
   WAL will plug in). Tested: single/sequential command replication, no-commit
   without a majority (then recovery), and a lagging follower catching up. All
   under `-race`, stable across repeated runs.
-- **Next:** step 3 persistence (term/votedFor/log survive restart), step 4
-  snapshots, step 5 WAL integration (apply committed entries via `segment.Manager`).
+- **Step 3 — persistence (done).** A `Storage` interface with an in-memory impl
+  (for tests) and a `FileStorage` that writes term/votedFor/log durably via the
+  atomic tmp+fsync+rename+dir-fsync recipe. The node persists on every change to
+  those fields BEFORE replying to the RPC, and restores them on startup. Tested:
+  file round-trip, votedFor surviving a restart (no double-vote in a term), and a
+  whole cluster rebooting from disk then continuing to commit (proving the log
+  survived). All under `-race`, stable across repeated runs.
+- **Next:** step 4 snapshots (bound the log / fast follower catch-up), step 5 WAL
+  integration (apply committed entries via `segment.Manager`; the FileStorage log
+  can later be swapped for the segment-based WAL, which needs suffix truncation).
 
 | Phase | Adds | Why this order |
 |-------|------|----------------|
